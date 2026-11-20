@@ -126,25 +126,40 @@ type UpdateResult struct {
 //
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
 func UpdateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string) (*UpdateResult, error) {
-	return updateIssueInTx(ctx, tx, id, updates, actor, true)
+	return updateIssueInTx(ctx, tx, id, updates, actor, true, "")
 }
 
 // UpdateIssueWithoutEventInTx applies normal update semantics without recording
 // an intermediate event. Demotion uses this to preserve the historical event
 // stream: create/update history is copied, then a single demotion event is added.
 func UpdateIssueWithoutEventInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string) (*UpdateResult, error) {
-	return updateIssueInTx(ctx, tx, id, updates, actor, false)
+	return updateIssueInTx(ctx, tx, id, updates, actor, false, "")
 }
 
-func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string, recordEvent bool) (*UpdateResult, error) {
+func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string, recordEvent bool, releaseAssignee string) (*UpdateResult, error) {
 	// Route to correct table.
 	isWisp := IsActiveWispInTx(ctx, tx, id)
-	issueTable, _, eventTable, _ := WispTableRouting(isWisp)
+	issueTable, labelTable, eventTable, _ := WispTableRouting(isWisp)
 
 	// Read old issue inside the transaction for consistency.
-	oldIssue, err := GetIssueInTx(ctx, tx, id)
+	var oldIssue *types.Issue
+	var err error
+	if releaseAssignee != "" {
+		// Read the same table the conditional write will target.
+		oldIssue, err = getIssueFromTableInTx(ctx, tx, issueTable, labelTable, id)
+	} else {
+		oldIssue, err = GetIssueInTx(ctx, tx, id)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issue for update: %w", err)
+	}
+	if releaseAssignee != "" {
+		if oldIssue.ID != id {
+			return nil, fmt.Errorf("%w: no issue with exact ID %q", storage.ErrNotFound, id)
+		}
+		if oldIssue.Status != types.StatusInProgress || oldIssue.Assignee != releaseAssignee {
+			return nil, fmt.Errorf("issue %q is not in progress under the expected assignee", id)
+		}
 	}
 
 	// Validate issue_type against built-in + custom types (GH#3030).
@@ -220,8 +235,22 @@ func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 
 	//nolint:gosec // G201: issueTable comes from WispTableRouting (hardcoded constants)
 	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?", issueTable, strings.Join(setClauses, ", "))
-	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+	if releaseAssignee != "" {
+		query += " AND CAST(id AS BINARY) = CAST(? AS BINARY) AND status = ? AND CAST(assignee AS BINARY) = CAST(? AS BINARY)"
+		args = append(args, id, types.StatusInProgress, releaseAssignee)
+	}
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
 		return nil, fmt.Errorf("failed to update issue: %w", err)
+	}
+	if releaseAssignee != "" {
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get release rows affected: %w", err)
+		}
+		if rows != 1 {
+			return nil, fmt.Errorf("issue %q no longer has the expected claim", id)
+		}
 	}
 
 	if recordEvent {
