@@ -14,6 +14,7 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql" // required by testcontainers Dolt module
+	"github.com/moby/moby/api/types/container"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/dolt"
 )
@@ -133,12 +134,19 @@ func isDoltRepoImageCached() bool {
 	return err == nil && len(strings.TrimSpace(string(out))) > 0
 }
 
+// Keep a disposable test server from exhausting a shared runner.
+func limitTestDolt(h *container.HostConfig) {
+	h.Memory = 768 << 20
+	h.OomScoreAdj = 800
+}
+
 // startDoltContainer starts the singleton Dolt container.
 func startDoltContainer() error {
 	ctx, cancel := context.WithTimeout(context.Background(), serverStartTimeout)
 	defer cancel()
 
 	ctr, err := dolt.Run(ctx, DoltDockerImage,
+		testcontainers.WithHostConfigModifier(limitTestDolt),
 		dolt.WithDatabase("beads_test"),
 		// Docker port-forwarding makes connections appear as non-localhost
 		// (e.g., 172.17.0.1). The entrypoint defaults DOLT_ROOT_HOST to
@@ -191,6 +199,7 @@ func StartIsolatedDoltContainer(t *testing.T) string {
 	ctx, cancel := context.WithTimeout(context.Background(), serverStartTimeout)
 	defer cancel()
 	ctr, err := dolt.Run(ctx, DoltDockerImage,
+		testcontainers.WithHostConfigModifier(limitTestDolt),
 		dolt.WithDatabase("beads_test"),
 		testcontainers.WithEnv(map[string]string{"DOLT_ROOT_HOST": "%"}),
 	)

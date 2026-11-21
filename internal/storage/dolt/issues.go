@@ -240,6 +240,41 @@ func (s *DoltStore) ClaimIssue(ctx context.Context, id string, actor string) err
 	return nil
 }
 
+// ReleaseClaim releases the expected claim or returns its existing receipt.
+func (s *DoltStore) ReleaseClaim(ctx context.Context, id, expectedAssignee, operationID, actor string) error {
+	_, err := s.ReleaseClaimWithResult(ctx, id, expectedAssignee, operationID, actor)
+	return err
+}
+
+// ReleaseClaimWithResult reports whether a successful release changed the issue.
+func (s *DoltStore) ReleaseClaimWithResult(ctx context.Context, id, expectedAssignee, operationID, actor string) (bool, error) {
+	var changed bool
+	err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		changed = false
+		result, err := issueops.ReleaseClaimInTx(ctx, tx, id, expectedAssignee, operationID, actor)
+		if err != nil || result == nil {
+			return err
+		}
+
+		tables := []string{"metadata"}
+		if !result.IsWisp {
+			tables = append(tables, "issues", "events")
+		}
+		for _, table := range tables {
+			if _, err := tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table); err != nil {
+				return fmt.Errorf("dolt add %s: %w", table, err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
+			fmt.Sprintf("bd: release claim %s", id), s.commitAuthorString()); err != nil {
+			return fmt.Errorf("dolt commit release claim: %w", err)
+		}
+		changed = true
+		return nil
+	})
+	return err == nil && changed, err
+}
+
 // ClaimReadyIssue atomically claims the first ready issue matching filter.
 func (s *DoltStore) ClaimReadyIssue(ctx context.Context, filter types.WorkFilter, actor string) (*types.Issue, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
