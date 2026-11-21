@@ -31,7 +31,6 @@ func TestProtocol_ReleaseClaimReceipt(t *testing.T) {
 	}{
 		{"missing assignee", []string{id, "--operation-id", op}},
 		{"missing operation", []string{id, "--expected-assignee", holder}},
-		{"wrong assignee", []string{id, "--expected-assignee", "zagcode-attempt-" + strings.Repeat("c", 24), "--operation-id", op}},
 		{"ordinary assignee", []string{id, "--expected-assignee", "operator", "--operation-id", op}},
 		{"abbreviated ID", []string{id[:len(id)-1], "--expected-assignee", holder, "--operation-id", op}},
 		{"read-only", []string{id, "--expected-assignee", holder, "--operation-id", op, "--readonly"}},
@@ -39,13 +38,54 @@ func TestProtocol_ReleaseClaimReceipt(t *testing.T) {
 	} {
 		args := append([]string{"release-claim", "--json"}, tc.args...)
 		out, code := w.runExpectError(args...)
-		if code != 1 || strings.Contains(out, `"released"`) {
-			t.Errorf("%s: expected refusal without a released receipt, got exit %d: %s", tc.name, code, out)
+		if code != 1 || strings.Contains(out, `"outcome"`) {
+			t.Errorf("%s: expected a generic failure without a receipt, got exit %d: %s", tc.name, code, out)
 		}
 	}
 	if got := w.showJSON(id)["assignee"]; got != holder {
 		t.Fatalf("assignee after refusals = %v, want %q", got, holder)
 	}
+
+	assertRefusal := func(id, expectedAssignee, operationID, reason string) {
+		t.Helper()
+		cmd := exec.Command(w.bd, "release-claim", id, "--expected-assignee", expectedAssignee, "--operation-id", operationID, "--json")
+		cmd.Dir = w.dir
+		cmd.Env = append(w.env(), "BD_JSON_ENVELOPE=1")
+		out, err := cmd.Output()
+		exitErr, ok := err.(*exec.ExitError)
+		if !ok || exitErr.ExitCode() != 3 {
+			t.Fatalf("want exit 3 for %s: stdout=%s, error=%v", reason, out, err)
+		}
+		want := map[string]string{
+			"outcome":           "refused",
+			"work_item_id":      id,
+			"expected_assignee": expectedAssignee,
+			"operation_id":      operationID,
+			"reason":            reason,
+		}
+		var got map[string]string
+		if err := json.Unmarshal(out, &got); err != nil || !maps.Equal(got, want) {
+			t.Fatalf("refusal receipt = %s (%v), want %v", out, err, want)
+		}
+	}
+	wrongHolder := "zagcode-attempt-" + strings.Repeat("c", 24)
+	refusedOp := "tracker-release:" + strings.Repeat("d", 64)
+	assertRefusal(id, wrongHolder, refusedOp, "holder_changed")
+	if got := w.showJSON(id)["assignee"]; got != holder {
+		t.Fatalf("assignee after holder mismatch = %v, want %q", got, holder)
+	}
+
+	// Once recorded, the refusal must replay even if the predicate later matches.
+	w.run("assign", id, wrongHolder)
+	assertRefusal(id, wrongHolder, refusedOp, "holder_changed")
+	issue := w.showJSON(id)
+	if issue["assignee"] != wrongHolder || issue["status"] != "in_progress" {
+		t.Fatalf("refusal replay changed the now-matching claim: %v", issue)
+	}
+	w.run("assign", id, holder)
+
+	openID := w.create("Open issue with assignee", "--assignee", holder)
+	assertRefusal(openID, holder, "tracker-release:"+strings.Repeat("e", 64), "not_in_progress")
 
 	want := map[string]string{
 		"outcome":           "released",

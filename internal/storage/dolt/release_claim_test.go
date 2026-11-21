@@ -2,9 +2,11 @@ package dolt
 
 import (
 	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -158,7 +160,7 @@ func TestReleaseClaimConcurrentOperations(t *testing.T) {
 	stage := func(tx *sql.Tx, op string) {
 		t.Helper()
 		result, err := issueops.ReleaseClaimInTx(ctx, tx, id, holder, op, actor)
-		if err != nil || result == nil {
+		if err != nil || !result.Recorded || result.Updated == nil {
 			t.Fatalf("stage release from original snapshot: result = %v, err = %v", result, err)
 		}
 		// Make the issue rows byte-for-byte equal regardless of wall time,
@@ -200,5 +202,94 @@ func TestReleaseClaimConcurrentOperations(t *testing.T) {
 	}
 	if err := store.ReleaseClaim(ctx, id, holder, op2, actor); err == nil {
 		t.Fatal("losing operation replay incorrectly returned a receipt")
+	}
+}
+
+func TestReleaseClaimRefusalIsImmutable(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	const (
+		holder    = "zagcode-attempt-111111111111111111111111"
+		successor = "zagcode-attempt-222222222222222222222222"
+		actor     = "tracker-test"
+	)
+	for _, tc := range []struct {
+		name   string
+		reason storage.ReleaseClaimRefusalReason
+		hex    string
+	}{
+		{"closed", storage.ReleaseClaimNotInProgress, "c"},
+		{"reassigned", storage.ReleaseClaimHolderChanged, "d"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "test-release-" + tc.name
+			op := "tracker-release:" + strings.Repeat(tc.hex, 64)
+			issue := &types.Issue{ID: id, Title: id, Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+			if err := store.CreateIssue(ctx, issue, actor); err != nil {
+				t.Fatalf("create issue: %v", err)
+			}
+			if err := store.ClaimIssue(ctx, id, holder); err != nil {
+				t.Fatalf("claim issue: %v", err)
+			}
+			if tc.reason == storage.ReleaseClaimNotInProgress {
+				if err := store.CloseIssue(ctx, id, "done", actor, ""); err != nil {
+					t.Fatalf("close issue: %v", err)
+				}
+			} else if err := store.UpdateIssue(ctx, id, map[string]interface{}{"assignee": successor}, actor); err != nil {
+				t.Fatalf("reassign issue: %v", err)
+			}
+
+			assertRefusal := func() {
+				t.Helper()
+				before, err := store.GetIssue(ctx, id)
+				if err != nil {
+					t.Fatalf("read issue before refusal: %v", err)
+				}
+				beforeEvents, err := store.GetEvents(ctx, id, 0)
+				if err != nil {
+					t.Fatalf("read audit before refusal: %v", err)
+				}
+				changed, err := store.ReleaseClaimWithResult(ctx, id, holder, op, actor)
+				var refusal *storage.ReleaseClaimRefusal
+				if changed || !errors.As(err, &refusal) || refusal.Reason != tc.reason {
+					t.Fatalf("release = (%v, %v); want durable refusal %s", changed, err, tc.reason)
+				}
+				after, err := store.GetIssue(ctx, id)
+				if err != nil {
+					t.Fatalf("read issue after refusal: %v", err)
+				}
+				if after.Status != before.Status || after.Assignee != before.Assignee || !after.UpdatedAt.Equal(before.UpdatedAt) {
+					t.Fatalf("refusal changed issue: before = %+v, after = %+v", before, after)
+				}
+				afterEvents, err := store.GetEvents(ctx, id, 0)
+				if err != nil || len(afterEvents) != len(beforeEvents) {
+					t.Fatalf("refusal changed audit: before = %d, after = %d, err = %v", len(beforeEvents), len(afterEvents), err)
+				}
+			}
+			assertRefusal()
+			var receipt string
+			if err := store.db.QueryRowContext(ctx, "SELECT value FROM metadata AS OF 'HEAD' WHERE `key` = ?",
+				"_release_claim_v1:"+op).Scan(&receipt); err != nil || !strings.Contains(receipt, string(tc.reason)) {
+				t.Fatalf("refusal receipt is not committed: %q, %v", receipt, err)
+			}
+
+			// The same predicate now matches. A fresh operation ID could release
+			// this claim, but this operation must keep its original refusal.
+			if err := store.UpdateIssue(ctx, id, map[string]interface{}{
+				"assignee": holder,
+				"status":   types.StatusInProgress,
+			}, actor); err != nil {
+				t.Fatalf("restore matching claim: %v", err)
+			}
+			assertRefusal()
+
+			var refusal *storage.ReleaseClaimRefusal
+			if err := store.ReleaseClaim(ctx, id, successor, op, actor); err == nil || errors.As(err, &refusal) {
+				t.Fatalf("conflicting tuple exposed definitive refusal: %v", err)
+			}
+		})
 	}
 }

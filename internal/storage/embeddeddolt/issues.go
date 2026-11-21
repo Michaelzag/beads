@@ -30,15 +30,16 @@ func (s *EmbeddedDoltStore) ReleaseClaim(ctx context.Context, id, expectedAssign
 
 // ReleaseClaimWithResult reports whether a successful release changed the issue.
 func (s *EmbeddedDoltStore) ReleaseClaimWithResult(ctx context.Context, id, expectedAssignee, operationID, actor string) (bool, error) {
-	var changed bool
+	var result issueops.ReleaseClaimResult
 	err := s.withConn(ctx, true, func(tx *sql.Tx) error {
-		result, err := issueops.ReleaseClaimInTx(ctx, tx, id, expectedAssignee, operationID, actor)
-		if err != nil || result == nil {
+		var err error
+		result, err = issueops.ReleaseClaimInTx(ctx, tx, id, expectedAssignee, operationID, actor)
+		if err != nil || !result.Recorded {
 			return err
 		}
 
 		tables := []string{"metadata"}
-		if !result.IsWisp {
+		if result.Updated != nil && !result.Updated.IsWisp {
 			tables = append(tables, "issues", "events")
 		}
 		for _, table := range tables {
@@ -49,10 +50,15 @@ func (s *EmbeddedDoltStore) ReleaseClaimWithResult(ctx context.Context, id, expe
 		if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', ?)", fmt.Sprintf("bd: release claim %s", id)); err != nil {
 			return fmt.Errorf("dolt commit release claim: %w", err)
 		}
-		changed = true
 		return nil
 	})
-	return err == nil && changed, err
+	if err != nil {
+		return false, err
+	}
+	if result.RefusalReason != "" {
+		return false, &storage.ReleaseClaimRefusal{Reason: result.RefusalReason}
+	}
+	return result.Updated != nil, nil
 }
 
 // ClaimReadyIssue atomically claims the first ready issue matching filter.
