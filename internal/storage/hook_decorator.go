@@ -109,20 +109,26 @@ func (h *HookFiringStore) UpdateIssue(ctx context.Context, id string, updates ma
 
 // ReleaseClaim fires on_update only when a claim was newly released.
 func (h *HookFiringStore) ReleaseClaim(ctx context.Context, id, expectedAssignee, operationID, actor string) error {
+	_, err := h.ReleaseClaimWithResult(ctx, id, expectedAssignee, operationID, actor)
+	return err
+}
+
+// ReleaseClaimWithResult reports a new mutation after firing its update hook.
+func (h *HookFiringStore) ReleaseClaimWithResult(ctx context.Context, id, expectedAssignee, operationID, actor string) (bool, error) {
 	store, ok := h.inner.(interface {
 		ReleaseClaimWithResult(ctx context.Context, id, expectedAssignee, operationID, actor string) (bool, error)
 	})
 	if !ok {
-		return errors.New("store does not support conditional claim release")
+		return false, errors.New("store does not support conditional claim release")
 	}
 	changed, err := store.ReleaseClaimWithResult(ctx, id, expectedAssignee, operationID, actor)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if changed {
 		h.fireHookByID(ctx, hooks.EventUpdate, id)
 	}
-	return nil
+	return changed, nil
 }
 
 // ReopenIssue reopens an issue and fires on_update.

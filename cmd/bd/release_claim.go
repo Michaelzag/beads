@@ -10,7 +10,7 @@ import (
 )
 
 type claimReleaser interface {
-	ReleaseClaim(ctx context.Context, id, expectedAssignee, operationID, actor string) error
+	ReleaseClaimWithResult(ctx context.Context, id, expectedAssignee, operationID, actor string) (changed bool, err error)
 }
 
 var (
@@ -50,10 +50,11 @@ var releaseClaimCmd = &cobra.Command{
 
 		expectedAssignee, _ := cmd.Flags().GetString("expected-assignee")
 		operationID, _ := cmd.Flags().GetString("operation-id")
-		if err := releaser.ReleaseClaim(rootCtx, args[0], expectedAssignee, operationID, actor); err != nil {
+		changed, err := releaser.ReleaseClaimWithResult(rootCtx, args[0], expectedAssignee, operationID, actor)
+		if err != nil {
 			return fmt.Errorf("releasing claim on %s: %w", args[0], err)
 		}
-		commandDidWrite.Store(true)
+		commandDidWrite.Store(changed)
 		return nil
 	},
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {

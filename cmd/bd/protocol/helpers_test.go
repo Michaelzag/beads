@@ -158,7 +158,7 @@ func testPrefix(t *testing.T) string {
 	return "t" + hex.EncodeToString(b[:]) // e.g. "t1a2b3c4d" — 9 chars, valid SQL identifier
 }
 
-func newWorkspace(t *testing.T) *workspace {
+func newWorkspace(t *testing.T, initFlags ...string) *workspace {
 	t.Helper()
 	testutil.RequireDoltBinary(t)
 	if testDoltPort == 0 {
@@ -179,7 +179,7 @@ func newWorkspace(t *testing.T) *workspace {
 	w.git("commit", "-m", "initial")
 
 	prefix := testPrefix(t)
-	w.run("init", "--prefix", prefix, "--quiet")
+	w.run(append([]string{"init", "--prefix", prefix, "--quiet"}, initFlags...)...)
 	return w
 }
 
@@ -275,8 +275,13 @@ func (w *workspace) create(args ...string) string {
 // showJSON runs bd show <id> --json and returns the first issue object.
 func (w *workspace) showJSON(id string) map[string]any {
 	w.t.Helper()
-	out := w.run("show", id, "--json")
-	items := parseJSONOutput(w.t, out)
+	cmd := exec.Command(w.bd, "show", id, "--json")
+	cmd.Dir, cmd.Env = w.dir, w.env()
+	stdout, err := cmd.Output()
+	if err != nil {
+		w.t.Fatalf("bd show %s: %v", id, err)
+	}
+	items := parseJSONOutput(w.t, string(stdout))
 	if len(items) == 0 {
 		w.t.Fatalf("bd show %s --json returned no items", id)
 	}

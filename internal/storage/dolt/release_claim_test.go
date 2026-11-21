@@ -1,9 +1,11 @@
 package dolt
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -116,5 +118,87 @@ func TestReleaseClaim(t *testing.T) {
 	}
 	if got := eventCount(); got != beforeEvents {
 		t.Fatalf("refusal changed closed issue audit: got %d events, want %d", got, beforeEvents)
+	}
+}
+
+func TestReleaseClaimConcurrentOperations(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	const (
+		id     = "test-release-contended"
+		holder = "zagcode-attempt-111111111111111111111111"
+		actor  = "tracker-test"
+	)
+	op1 := "tracker-release:" + strings.Repeat("a", 64)
+	op2 := "tracker-release:" + strings.Repeat("b", 64)
+	issue := &types.Issue{ID: id, Title: id, Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
+	if err := store.CreateIssue(ctx, issue, actor); err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	if err := store.ClaimIssue(ctx, id, holder); err != nil {
+		t.Fatalf("claim issue: %v", err)
+	}
+
+	begin := func() *sql.Tx {
+		t.Helper()
+		tx, err := store.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin release transaction: %v", err)
+		}
+		return tx
+	}
+	tx1 := begin()
+	defer func() { _ = tx1.Rollback() }()
+	tx2 := begin()
+	defer func() { _ = tx2.Rollback() }()
+
+	stage := func(tx *sql.Tx, op string) {
+		t.Helper()
+		result, err := issueops.ReleaseClaimInTx(ctx, tx, id, holder, op, actor)
+		if err != nil || result == nil {
+			t.Fatalf("stage release from original snapshot: result = %v, err = %v", result, err)
+		}
+		// Make the issue rows byte-for-byte equal regardless of wall time,
+		// as they would be if both updates reached Dolt in the same second.
+		if _, err := tx.ExecContext(ctx, "UPDATE issues SET updated_at = '2025-01-02 03:04:05' WHERE id = ?", id); err != nil {
+			t.Fatalf("normalize release timestamps: %v", err)
+		}
+	}
+	stage(tx1, op1)
+	stage(tx2, op2)
+
+	if err := tx1.Commit(); err != nil {
+		t.Fatalf("first release commit: %v", err)
+	}
+	if err := tx2.Commit(); err == nil {
+		t.Fatal("second release committed from the same original snapshot")
+	}
+
+	var receipts int
+	if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM metadata WHERE `key` IN (?, ?)",
+		"_release_claim_v1:"+op1, "_release_claim_v1:"+op2).Scan(&receipts); err != nil || receipts != 1 {
+		t.Fatalf("release receipts = %d, err = %v; want 1", receipts, err)
+	}
+	events, err := store.GetEvents(ctx, id, 0)
+	if err != nil {
+		t.Fatalf("read release audit: %v", err)
+	}
+	var releases int
+	for _, event := range events {
+		if event.EventType == types.EventStatusChanged && event.Actor == actor {
+			releases++
+		}
+	}
+	if releases != 1 {
+		t.Fatalf("release audit events = %d; want 1", releases)
+	}
+	if changed, err := store.ReleaseClaimWithResult(ctx, id, holder, op1, actor); err != nil || changed {
+		t.Fatalf("winning receipt replay: changed = %v, err = %v; want false, nil", changed, err)
+	}
+	if err := store.ReleaseClaim(ctx, id, holder, op2, actor); err == nil {
+		t.Fatal("losing operation replay incorrectly returned a receipt")
 	}
 }
