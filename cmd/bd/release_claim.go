@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 type claimReleaser interface {
@@ -22,6 +25,7 @@ var releaseClaimCmd = &cobra.Command{
 	Use:          "release-claim ID --expected-assignee HOLDER --operation-id OP",
 	GroupID:      "issues",
 	Short:        "Release a tracker claim held by the expected assignee",
+	Long:         "Release a tracker claim held by the expected assignee. A durable refusal exits with code 3 and a JSON receipt.",
 	SilenceUsage: true,
 	Args: func(cmd *cobra.Command, args []string) error {
 		if err := cobra.ExactArgs(1)(cmd, args); err != nil {
@@ -52,6 +56,20 @@ var releaseClaimCmd = &cobra.Command{
 		operationID, _ := cmd.Flags().GetString("operation-id")
 		changed, err := releaser.ReleaseClaimWithResult(rootCtx, args[0], expectedAssignee, operationID, actor)
 		if err != nil {
+			var refusal *storage.ReleaseClaimRefusal
+			if !changed && errors.As(err, &refusal) && refusal != nil {
+				switch refusal.Reason {
+				case storage.ReleaseClaimHolderChanged, storage.ReleaseClaimNotInProgress:
+					outputJSONRaw(map[string]string{
+						"outcome":           "refused",
+						"work_item_id":      args[0],
+						"expected_assignee": expectedAssignee,
+						"operation_id":      operationID,
+						"reason":            string(refusal.Reason),
+					})
+					os.Exit(3)
+				}
+			}
 			return fmt.Errorf("releasing claim on %s: %w", args[0], err)
 		}
 		commandDidWrite.Store(changed)

@@ -23,6 +23,24 @@ var ErrAlreadyClaimed = errors.New("issue already claimed")
 // same actor owning the claim.
 var ErrNotClaimable = errors.New("issue not claimable")
 
+// ReleaseClaimRefusalReason identifies a definitive conditional release failure.
+type ReleaseClaimRefusalReason string
+
+const (
+	ReleaseClaimHolderChanged ReleaseClaimRefusalReason = "holder_changed"
+	ReleaseClaimNotInProgress ReleaseClaimRefusalReason = "not_in_progress"
+)
+
+// ReleaseClaimRefusal is returned only after confirming an exact, durable
+// no-release receipt. Other errors do not prove the operation's outcome.
+type ReleaseClaimRefusal struct {
+	Reason ReleaseClaimRefusalReason
+}
+
+func (e *ReleaseClaimRefusal) Error() string {
+	return "claim release refused: " + string(e.Reason)
+}
+
 // ErrNotFound is returned when a requested entity does not exist in the database.
 var ErrNotFound = errors.New("not found")
 

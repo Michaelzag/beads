@@ -116,8 +116,9 @@ func DetermineEventType(oldIssue *types.Issue, updates map[string]interface{}) t
 
 // UpdateResult holds the result of an UpdateIssueInTx call.
 type UpdateResult struct {
-	OldIssue *types.Issue
-	IsWisp   bool
+	OldIssue       *types.Issue
+	IsWisp         bool
+	releaseRefusal storage.ReleaseClaimRefusalReason
 }
 
 // UpdateIssueInTx performs the full update SQL logic within a transaction.
@@ -157,8 +158,11 @@ func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 		if oldIssue.ID != id {
 			return nil, fmt.Errorf("%w: no issue with exact ID %q", storage.ErrNotFound, id)
 		}
-		if oldIssue.Status != types.StatusInProgress || oldIssue.Assignee != releaseAssignee {
-			return nil, fmt.Errorf("issue %q is not in progress under the expected assignee", id)
+		if oldIssue.Status != types.StatusInProgress {
+			return &UpdateResult{releaseRefusal: storage.ReleaseClaimNotInProgress}, nil
+		}
+		if oldIssue.Assignee != releaseAssignee {
+			return &UpdateResult{releaseRefusal: storage.ReleaseClaimHolderChanged}, nil
 		}
 	}
 
