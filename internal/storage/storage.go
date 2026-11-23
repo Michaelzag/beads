@@ -41,6 +41,58 @@ func (e *ReleaseClaimRefusal) Error() string {
 	return "claim release refused: " + string(e.Reason)
 }
 
+// CloseClaimIntent binds an operation to exactly one expected tracker state.
+type CloseClaimIntent struct {
+	WorkItemID                string `json:"work_item_id"`
+	ExpectedAssignee          string `json:"expected_assignee"`
+	ExpectedAcceptanceDigest string `json:"expected_acceptance_digest"`
+	ExpectedRepoLabelsDigest  string `json:"expected_repo_labels_digest"`
+	OperationID               string `json:"operation_id"`
+	CloseReason               string `json:"close_reason"`
+}
+
+type CloseClaimOutcome string
+
+const (
+	CloseClaimClosed  CloseClaimOutcome = "closed"
+	CloseClaimRefused CloseClaimOutcome = "refused"
+	CloseClaimMissing CloseClaimOutcome = "missing"
+)
+
+type CloseClaimRefusalReason string
+
+const (
+	CloseClaimClosedByOther        CloseClaimRefusalReason = "closed_by_other"
+	CloseClaimCustodyMismatch      CloseClaimRefusalReason = "custody_mismatch"
+	CloseClaimBlocked              CloseClaimRefusalReason = "close_blocked"
+	CloseClaimClosurePolicyRefused CloseClaimRefusalReason = "closure_policy_refused"
+	CloseClaimNotFound             CloseClaimRefusalReason = "not_found"
+)
+
+// CloseClaimReceipt is returned only after the backing operation was committed,
+// or as a missing result from a read-only lookup.
+type CloseClaimReceipt struct {
+	Outcome CloseClaimOutcome `json:"outcome"`
+	CloseClaimIntent
+	Reason CloseClaimRefusalReason `json:"reason,omitempty"`
+}
+
+// CloseClaimMode controls what happens when no committed receipt exists.
+// Every mode replays an existing receipt with the same intent and actor.
+type CloseClaimMode uint8
+
+const (
+	CloseClaimExecute CloseClaimMode = iota
+	CloseClaimLookup
+	CloseClaimRefuseIfMissing
+)
+
+// CloseClaimStore is supported by the direct Dolt backends. The gate check
+// receives the issue from the transaction and must not re-enter the store.
+type CloseClaimStore interface {
+	CloseClaim(ctx context.Context, intent CloseClaimIntent, actor string, mode CloseClaimMode, checkGate func(*types.Issue) error) (CloseClaimReceipt, error)
+}
+
 // ErrNotFound is returned when a requested entity does not exist in the database.
 var ErrNotFound = errors.New("not found")
 
