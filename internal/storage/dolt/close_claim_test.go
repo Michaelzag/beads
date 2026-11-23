@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -435,10 +436,8 @@ func TestConditionalCloseConcurrentPredicateWrites(t *testing.T) {
 	label := func(add, batch bool) mutation {
 		return func(ctx context.Context, tx *sql.Tx, id, _ string) ([]string, error) {
 			if batch {
-				// Exercise the batch methods (and their actual dirty-table
-				// tracking). Both handles can read this regular-only fixture
-				// through the same SQL session for the wisp routing check.
-				bulk := &doltTransaction{regularTx: tx, ignoredTx: tx, store: store}
+				// Exercise the batch methods and their actual dirty-table tracking.
+				bulk := &doltTransaction{tx: tx, store: store}
 				var err error
 				if add {
 					err = bulk.AddLabel(ctx, id, "repo:new", closeTestActor)
@@ -550,5 +549,93 @@ func TestConditionalCloseConcurrentPredicateWrites(t *testing.T) {
 				t.Fatalf("losing close events at HEAD = %d (%v), want 0", events, err)
 			}
 		})
+	}
+}
+
+func TestConditionalCloseConcurrentLegacyDependencyAlias(t *testing.T) {
+	skipIfNoDolt(t)
+	acquireTestSlot()
+	t.Cleanup(releaseTestSlot)
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Migrate a disposable database with a case-insensitive default so
+	// both the issue PK and the dependency FK inherit the legacy collation.
+	dbName := uniqueTestDBName(t)
+	adminDSN := doltutil.ServerDSN{Host: "127.0.0.1", Port: testServerPort, User: "root"}.String()
+	admin, err := sql.Open("mysql", adminDSN)
+	if err != nil {
+		t.Fatalf("open isolated Dolt test server: %v", err)
+	}
+	defer admin.Close()
+	if _, err := admin.ExecContext(ctx, "CREATE DATABASE `"+dbName+"` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"); err != nil {
+		t.Fatalf("create case-insensitive database: %v", err)
+	}
+	store, err := New(ctx, &Config{
+		Path:           t.TempDir(),
+		CommitterName:  "test",
+		CommitterEmail: "test@example.com",
+		Database:       dbName,
+		ServerHost:     "127.0.0.1",
+		ServerPort:     testServerPort,
+		MaxOpenConns:   2,
+	})
+	if err != nil {
+		t.Fatalf("open case-insensitive database: %v", err)
+	}
+	// As in setupConcurrentTestStore, let the test server dispose of the database.
+	defer store.Close()
+	store.db.SetMaxIdleConns(0)
+	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("set test issue prefix: %v", err)
+	}
+
+	const (
+		id      = "test-close-legacy-depender"
+		alias   = "test-close-LEGACY-depender"
+		blocker = "test-close-legacy-blocker"
+	)
+	intent := closeTestIntent(id, 300)
+	createCloseTestIssue(t, ctx, store, id)
+	createCloseTestIssue(t, ctx, store, blocker)
+	if err := store.CloseIssue(ctx, blocker, "fixture: initially closed", closeTestActor, ""); err != nil {
+		t.Fatalf("close blocker: %v", err)
+	}
+	var canonical string
+	if err := store.db.QueryRowContext(ctx, "SELECT id FROM issues WHERE id = ?", alias).Scan(&canonical); err != nil || canonical != id {
+		t.Fatalf("issue lookup by alias = %q (%v), want stored ID %q", canonical, err, id)
+	}
+
+	// Seed the spelling an older import could persist. Both overlapping
+	// mutations below use the production issue operations.
+	if _, err := store.db.ExecContext(ctx, `
+		INSERT INTO dependencies (issue_id, depends_on_issue_id, type, created_at, created_by)
+		VALUES (?, ?, 'blocks', NOW(), ?)
+	`, alias, blocker, closeTestActor); err != nil {
+		t.Fatalf("seed legacy dependency alias: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, "CALL DOLT_COMMIT('-am', 'test: seed legacy dependency alias')"); err != nil {
+		t.Fatalf("commit legacy dependency alias: %v", err)
+	}
+	var stored string
+	if err := store.db.QueryRowContext(ctx, `
+		SELECT issue_id FROM dependencies AS OF 'HEAD'
+		WHERE issue_id = ? AND depends_on_issue_id = ?
+	`, id, blocker).Scan(&stored); err != nil || stored != alias {
+		t.Fatalf("legacy dependency source = %q (%v), want collation alias %q", stored, err, alias)
+	}
+
+	runCloseTestOverlap(t, ctx, store, id, func(tx *sql.Tx) []string {
+		if _, err := issueops.UpdateIssueInTx(ctx, tx, blocker, map[string]interface{}{"status": types.StatusOpen}, closeTestActor); err != nil {
+			t.Fatalf("stage blocker reopen: %v", err)
+		}
+		return []string{"issues", "events", "metadata"}
+	}, func(tx *sql.Tx) []string {
+		return stageCloseTestClaim(t, ctx, tx, intent, storage.CloseClaimExecute, storage.CloseClaimClosed)
+	})
+	assertCloseTestStale(t, ctx, store, intent, storage.CloseClaimBlocked)
+	var status types.Status
+	if err := store.db.QueryRowContext(ctx, "SELECT status FROM issues AS OF 'HEAD' WHERE id = ?", id).Scan(&status); err != nil || status != types.StatusInProgress {
+		t.Fatalf("depender status at HEAD = %q (%v), want %s", status, err, types.StatusInProgress)
 	}
 }

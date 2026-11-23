@@ -660,23 +660,24 @@ func PersistDependenciesWithOptionsResult(ctx context.Context, tx *sql.Tx, issue
 				dep.IssueID = issue.ID
 			}
 
-			kind := ClassifyDepTarget(ctx, tx, dep, false)
+			kind := DepTargetIssue
 			targetID := dep.DependsOnID
-
-			if kind != DepTargetExternal {
-				lookupTable := "issues"
-				if kind == DepTargetWisp {
-					lookupTable = "wisps"
-				}
-				// Read the stored spelling: the target lookup can use a case-insensitive collation.
-				//nolint:gosec // G201: lookupTable is one of two hardcoded constants
-				if err := tx.QueryRowContext(ctx,
-					fmt.Sprintf("SELECT id FROM %s WHERE id = ?", lookupTable),
-					dep.DependsOnID).Scan(&targetID); err != nil {
+			if strings.HasPrefix(targetID, "external:") {
+				kind = DepTargetExternal
+			} else {
+				// Resolve the target and its table in SQL, preserving the stored spelling.
+				err := tx.QueryRowContext(ctx, "SELECT id FROM wisps WHERE id = ?", targetID).Scan(&targetID)
+				switch {
+				case err == nil:
+					kind = DepTargetWisp
+				case err == sql.ErrNoRows || isTableNotExistError(err):
+					err = tx.QueryRowContext(ctx, "SELECT id FROM issues WHERE id = ?", targetID).Scan(&targetID)
 					if err == sql.ErrNoRows {
 						recordSkippedDependency(opts, dep, "target not found")
 						continue
 					}
+				}
+				if err != nil {
 					return result, fmt.Errorf("failed to check dependency target %s for %s: %w", dep.DependsOnID, dep.IssueID, err)
 				}
 			}
@@ -714,7 +715,7 @@ func PersistDependenciesWithOptionsResult(ctx context.Context, tx *sql.Tx, issue
 					INSERT INTO %s (issue_id, %s, type, created_by, created_at)
 					VALUES (?, ?, ?, ?, ?)
 					ON DUPLICATE KEY UPDATE type = type
-				`, depTable, kind.Column()), dep.IssueID, dep.DependsOnID, dep.Type, actor, createdAt)
+				`, depTable, kind.Column()), sourceID, targetID, dep.Type, actor, createdAt)
 			if err != nil {
 				return result, fmt.Errorf("failed to insert dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)
 			}
@@ -727,10 +728,6 @@ func PersistDependenciesWithOptionsResult(ctx context.Context, tx *sql.Tx, issue
 				afterIssues, afterWisps, err := findAffected(ctx, tx, sourceID, targetID, dep.Type)
 				if err != nil {
 					return result, fmt.Errorf("affected after persisting dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)
-				}
-				// A typed foreign key can store the input spelling rather than the parent row's spelling.
-				if sourceID != dep.IssueID || targetID != dep.DependsOnID {
-					afterIssues = append(afterIssues, dep.IssueID, dep.DependsOnID)
 				}
 				if err := BumpDependencyCloseGuardsInTx(ctx, tx, sourceID, targetID, beforeIssues, beforeWisps, afterIssues, afterWisps); err != nil {
 					return result, err

@@ -24,6 +24,10 @@ func TestRunInTransactionIgnoredWritesStayOnActiveBranch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current branch: %v", err)
 	}
+	head, err := store.GetCurrentCommit(ctx)
+	if err != nil {
+		t.Fatalf("read HEAD before wisp write: %v", err)
+	}
 
 	wispID := "test-wisp-branch-local"
 	wisp := &types.Issue{
@@ -38,6 +42,9 @@ func TestRunInTransactionIgnoredWritesStayOnActiveBranch(t *testing.T) {
 		return tx.CreateIssue(ctx, wisp, "tester")
 	}); err != nil {
 		t.Fatalf("RunInTransaction create wisp: %v", err)
+	}
+	if got, err := store.GetCurrentCommit(ctx); err != nil || got != head {
+		t.Fatalf("HEAD after wisp-only write = %s (%v), want %s", got, err, head)
 	}
 
 	assertWispCount(ctx, t, store.db, wispID, 1)
@@ -149,6 +156,100 @@ func TestRunInTransactionCreateIssuesMixedWispReadYourWrites(t *testing.T) {
 	assertIssueCount(ctx, t, store.db, regular.ID, 1)
 	assertWispCount(ctx, t, store.db, wisp.ID, 1)
 	assertTableCount(ctx, t, store.db, "wisp_labels", wisp.ID, 2)
+}
+
+func TestRunInTransactionMixedTrackerWrites(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T) (*DoltStore, func())
+		race  bool
+	}{
+		{name: "single writer", setup: setupTestStore},
+		{name: "conditional close wins", setup: setupConcurrentTestStore, race: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, cleanup := tc.setup(t)
+			defer cleanup()
+			ctx, cancel := testContext(t)
+			defer cancel()
+
+			const parentID = "test-mixed-parent"
+			const waiterID = "test-mixed-waiter"
+			const childID = "test-wisp-mixed-child"
+			const newAssignee = "mixed-assignee"
+			createCloseTestIssue(t, ctx, store, parentID)
+			createPerm(t, ctx, store, waiterID)
+			if err := store.AddDependency(ctx, &types.Dependency{
+				IssueID: waiterID, DependsOnID: parentID, Type: types.DepWaitsFor,
+			}, closeTestActor); err != nil {
+				t.Fatalf("seed waits-for edge: %v", err)
+			}
+			if getIsBlocked(t, ctx, store, "issues", waiterID) {
+				t.Fatal("waiter blocked before adding an active child")
+			}
+
+			intent := closeTestIntent(parentID, 1)
+			updatedID := parentID
+			wantAssignee, wantBlocked, wantChildren := newAssignee, true, 1
+			if tc.race {
+				// Avoid an assignee write to the row that the close updates:
+				// the child edge must contend even without that overlap.
+				updatedID = waiterID
+				wantAssignee, wantBlocked, wantChildren = "", false, 0
+			}
+			err := store.RunInTransaction(ctx, "test: mixed tracker writes", func(tx storage.Transaction) error {
+				if err := tx.UpdateIssue(ctx, updatedID, map[string]interface{}{"assignee": newAssignee}, closeTestActor); err != nil {
+					return err
+				}
+				if err := tx.CreateIssue(ctx, &types.Issue{
+					ID: childID, Title: "active wisp child", Status: types.StatusOpen,
+					Priority: 2, IssueType: types.TypeTask, Ephemeral: true,
+				}, closeTestActor); err != nil {
+					return err
+				}
+				if err := tx.AddDependency(ctx, &types.Dependency{
+					IssueID: childID, DependsOnID: parentID, Type: types.DepParentChild,
+				}, closeTestActor); err != nil {
+					return err
+				}
+				if tc.race {
+					// Publish the close from a second session while the mixed
+					// transaction still holds its original snapshot.
+					receipt, err := store.CloseClaim(ctx, intent, closeTestActor, storage.CloseClaimExecute, nil)
+					if err != nil || receipt.Outcome != storage.CloseClaimClosed {
+						return fmt.Errorf("publish conditional close: receipt %+v, error %v", receipt, err)
+					}
+				}
+				return nil
+			})
+			if tc.race {
+				if !isSerializationError(err) {
+					t.Fatalf("stale mixed transaction: want serialization conflict, got %v", err)
+				}
+				receipt, err := store.CloseClaim(ctx, intent, closeTestActor, storage.CloseClaimLookup, nil)
+				if err != nil || receipt.Outcome != storage.CloseClaimClosed {
+					t.Fatalf("lookup winning close: receipt %+v, error %v", receipt, err)
+				}
+			} else if err != nil {
+				t.Fatalf("RunInTransaction mixed tracker writes: %v", err)
+			}
+
+			for _, query := range []string{
+				"SELECT COALESCE(assignee, '') FROM issues WHERE id = ?",
+				"SELECT COALESCE(assignee, '') FROM issues AS OF 'HEAD' WHERE id = ?",
+			} {
+				var got string
+				if err := store.db.QueryRowContext(ctx, query, updatedID).Scan(&got); err != nil || got != wantAssignee {
+					t.Fatalf("%s: assignee = %q (%v), want %q", query, got, err, wantAssignee)
+				}
+			}
+			assertWispCount(ctx, t, store.db, childID, wantChildren)
+			assertTableCount(ctx, t, store.db, "wisp_dependencies", childID, wantChildren)
+			if got := getIsBlocked(t, ctx, store, "issues", waiterID); got != wantBlocked {
+				t.Fatalf("waiter is_blocked = %t, want %t", got, wantBlocked)
+			}
+		})
+	}
 }
 
 func TestRunInTransactionCreateIssuesAllWispBatchReconcilesChildCounters(t *testing.T) {

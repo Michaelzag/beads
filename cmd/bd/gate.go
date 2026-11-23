@@ -681,13 +681,16 @@ func queryGitHubRunsForWorkflow(workflow string, limit int) ([]GHWorkflowRun, er
 }
 
 var errNoWorkflowRuns = errors.New("no workflow runs found")
-type noWorkflowRunsError struct{ workflow string }
+type noWorkflowRunsError struct {
+	workflow  string
+	malformed bool
+}
 
 func (e noWorkflowRunsError) Error() string {
 	return fmt.Sprintf("no runs found for workflow '%s'", e.workflow)
 }
 
-func (e noWorkflowRunsError) Is(target error) bool { return target == errNoWorkflowRuns }
+func (e noWorkflowRunsError) Is(target error) bool { return target == errNoWorkflowRuns && !e.malformed }
 
 
 // discoverRunIDByWorkflowName queries GitHub for the most recent run of a workflow.
@@ -700,7 +703,7 @@ func discoverRunIDByWorkflowName(workflowHint string) (string, error) {
 	}
 
 	if len(runs) == 0 {
-		return "", noWorkflowRunsError{workflow: workflowHint}
+		return "", noWorkflowRunsError{workflow: workflowHint, malformed: runs == nil}
 	}
 
 	// Take the most recent run (gh returns newest-first)
@@ -793,10 +796,15 @@ func checkGHRunStatusWithErrors(runID string, strict bool) (resolved, escalated 
 		case "cancelled", "canceled":
 			return false, true, fmt.Sprintf("workflow '%s' was canceled", status.Name), nil
 		case "skipped":
+			if strict {
+				return false, true, fmt.Sprintf("workflow '%s' was skipped", status.Name), nil
+			}
 			return true, false, fmt.Sprintf("workflow '%s' was skipped", status.Name), nil
+		case "action_required", "neutral", "stale", "startup_failure", "timed_out":
+			return false, true, fmt.Sprintf("workflow '%s' concluded with %s", status.Name, status.Conclusion), nil
 		default:
-			if strict && status.Conclusion == "" {
-				return false, false, "", fmt.Errorf("completed workflow has no conclusion")
+			if strict {
+				return false, false, "", fmt.Errorf("unknown workflow conclusion %q", status.Conclusion)
 			}
 			return false, true, fmt.Sprintf("workflow '%s' concluded with %s", status.Name, status.Conclusion), nil
 		}
