@@ -38,6 +38,19 @@ func ClaimIssueInTx(ctx context.Context, tx *sql.Tx, id string, actor string) (*
 		return nil, fmt.Errorf("failed to get issue for claim: %w", err)
 	}
 
+	// Capture graph readers before the CAS, but only use the result if the
+	// CAS succeeds. Replays and failed claims must not write a guard.
+	var affectedIssues, affectedWisps, guardIDs []string
+	var guardErr error
+	if isWisp {
+		affectedIssues, affectedWisps, guardErr = AffectedByStatusChangeForWispInTx(ctx, tx, oldIssue.ID)
+	} else {
+		affectedIssues, affectedWisps, guardErr = AffectedByStatusChangeInTx(ctx, tx, oldIssue.ID)
+	}
+	if guardErr == nil {
+		guardIDs, guardErr = statusCloseGuardIDsInTx(ctx, tx, oldIssue.ID, affectedIssues, affectedWisps)
+	}
+
 	now := time.Now().UTC()
 
 	// Conditional UPDATE: only succeeds while the issue is still claimable.
@@ -91,6 +104,13 @@ func ClaimIssueInTx(ctx context.Context, tx *sql.Tx, id string, actor string) (*
 			return nil, fmt.Errorf("%w by %s", storage.ErrAlreadyClaimed, assignee)
 		}
 		return nil, fmt.Errorf("%w: status %s", storage.ErrNotClaimable, currentStatus)
+	}
+
+	if guardErr != nil {
+		return nil, fmt.Errorf("affected by claim for %s: %w", id, guardErr)
+	}
+	if err := BumpCloseGuardsInTx(ctx, tx, guardIDs...); err != nil {
+		return nil, err
 	}
 
 	// Record the claim event.

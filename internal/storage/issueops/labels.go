@@ -143,9 +143,8 @@ func AddLabelInTx(ctx context.Context, tx *sql.Tx, labelTable, eventTable, issue
 			eventTable = et
 		}
 	}
-	//nolint:gosec // G201: labelTable is from WispTableRouting ("labels" or "wisp_labels")
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT IGNORE INTO %s (issue_id, label) VALUES (?, ?)`, labelTable), issueID, label); err != nil {
-		return fmt.Errorf("add label: %w", err)
+	if err := AddLabelWithoutEventInTx(ctx, tx, labelTable, issueID, label); err != nil {
+		return err
 	}
 	comment := "Added label: " + label
 	//nolint:gosec // G201: eventTable is from WispTableRouting ("events" or "wisp_events")
@@ -172,8 +171,8 @@ func RemoveLabelInTx(ctx context.Context, tx *sql.Tx, labelTable, eventTable, is
 			eventTable = et
 		}
 	}
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE issue_id = ? AND label = ?`, labelTable), issueID, label); err != nil {
-		return fmt.Errorf("remove label: %w", err)
+	if err := RemoveLabelWithoutEventInTx(ctx, tx, labelTable, issueID, label); err != nil {
+		return err
 	}
 	comment := "Removed label: " + label
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (issue_id, event_type, actor, comment) VALUES (?, ?, ?, ?)`, eventTable),
@@ -181,4 +180,59 @@ func RemoveLabelInTx(ctx context.Context, tx *sql.Tx, labelTable, eventTable, is
 		return fmt.Errorf("remove label: record event: %w", err)
 	}
 	return nil
+}
+
+// AddLabelWithoutEventInTx inserts a label and guards a changed repo label
+// without adding an audit event. Callers supply the routed label table.
+//
+//nolint:gosec // G201: labelTable is from WispTableRouting.
+func AddLabelWithoutEventInTx(ctx context.Context, tx *sql.Tx, labelTable, issueID, label string) error {
+	result, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT IGNORE INTO %s (issue_id, label) VALUES (?, ?)`, labelTable), issueID, label)
+	if err != nil {
+		return fmt.Errorf("add label: %w", err)
+	}
+	if !strings.HasPrefix(label, "repo:") {
+		return nil
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("add label: get rows affected: %w", err)
+	}
+	if rows == 0 {
+		return nil
+	}
+	return bumpRepoLabelCloseGuardInTx(ctx, tx, labelTable, issueID)
+}
+
+// RemoveLabelWithoutEventInTx removes a label and guards a changed repo label
+// without adding an audit event. Callers supply the routed label table.
+//
+//nolint:gosec // G201: labelTable is from WispTableRouting.
+func RemoveLabelWithoutEventInTx(ctx context.Context, tx *sql.Tx, labelTable, issueID, label string) error {
+	// Match the existing DELETE's collation, then test the returned spelling
+	// with the same exact prefix check as the close predicate.
+	var storedLabel string
+	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT label FROM %s WHERE issue_id = ? AND label = ?`, labelTable), issueID, label).Scan(&storedLabel)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("remove label: read stored label: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE issue_id = ? AND label = ?`, labelTable), issueID, label); err != nil {
+		return fmt.Errorf("remove label: %w", err)
+	}
+	if strings.HasPrefix(storedLabel, "repo:") {
+		return bumpRepoLabelCloseGuardInTx(ctx, tx, labelTable, issueID)
+	}
+	return nil
+}
+
+func bumpRepoLabelCloseGuardInTx(ctx context.Context, tx *sql.Tx, labelTable, issueID string) error {
+	issueTable, _, _, _ := WispTableRouting(labelTable == "wisp_labels")
+	exactID, err := closeGuardIssueIDInTx(ctx, tx, issueTable, issueID)
+	if err != nil {
+		return err
+	}
+	return BumpCloseGuardsInTx(ctx, tx, exactID)
 }

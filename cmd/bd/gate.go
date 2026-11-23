@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -679,6 +680,19 @@ func queryGitHubRunsForWorkflow(workflow string, limit int) ([]GHWorkflowRun, er
 	return runs, nil
 }
 
+var errNoWorkflowRuns = errors.New("no workflow runs found")
+type noWorkflowRunsError struct {
+	workflow  string
+	malformed bool
+}
+
+func (e noWorkflowRunsError) Error() string {
+	return fmt.Sprintf("no runs found for workflow '%s'", e.workflow)
+}
+
+func (e noWorkflowRunsError) Is(target error) bool { return target == errNoWorkflowRuns && !e.malformed }
+
+
 // discoverRunIDByWorkflowName queries GitHub for the most recent run of a workflow.
 // Returns (runID, error). This is ZFC-compliant: "most recent run" is deterministic.
 func discoverRunIDByWorkflowName(workflowHint string) (string, error) {
@@ -689,7 +703,7 @@ func discoverRunIDByWorkflowName(workflowHint string) (string, error) {
 	}
 
 	if len(runs) == 0 {
-		return "", fmt.Errorf("no runs found for workflow '%s'", workflowHint)
+		return "", noWorkflowRunsError{workflow: workflowHint, malformed: runs == nil}
 	}
 
 	// Take the most recent run (gh returns newest-first)
@@ -700,7 +714,14 @@ func discoverRunIDByWorkflowName(workflowHint string) (string, error) {
 // checkGHRun checks a GitHub Actions workflow run gate.
 // When persistDiscoveredRunID is false, workflow-name discovery stays in-memory only.
 func checkGHRun(gate *types.Issue, persistDiscoveredRunID bool) (resolved, escalated bool, reason string, err error) {
+	return checkGHRunWithErrors(gate, persistDiscoveredRunID, false)
+}
+
+func checkGHRunWithErrors(gate *types.Issue, persistDiscoveredRunID, strict bool) (resolved, escalated bool, reason string, err error) {
 	if gate.AwaitID == "" {
+		if strict {
+			return false, false, "", fmt.Errorf("no run ID specified")
+		}
 		return false, false, "no run ID specified - set await_id or use workflow name hint", nil
 	}
 
@@ -710,6 +731,9 @@ func checkGHRun(gate *types.Issue, persistDiscoveredRunID bool) (resolved, escal
 	if !isNumericID(gate.AwaitID) {
 		discoveredID, discoverErr := discoverRunIDByWorkflowNameFunc(gate.AwaitID)
 		if discoverErr != nil {
+			if strict && !errors.Is(discoverErr, errNoWorkflowRuns) {
+				return false, false, "", fmt.Errorf("workflow hint %q: %w", gate.AwaitID, discoverErr)
+			}
 			return false, false, fmt.Sprintf("workflow hint '%s': %v", gate.AwaitID, discoverErr), nil
 		}
 
@@ -723,10 +747,17 @@ func checkGHRun(gate *types.Issue, persistDiscoveredRunID bool) (resolved, escal
 		runID = discoveredID
 	}
 
+	if strict {
+		return checkGHRunStatusWithErrors(runID, true)
+	}
 	return checkGHRunStatusFunc(runID)
 }
 
 func checkGHRunStatus(runID string) (resolved, escalated bool, reason string, err error) {
+	return checkGHRunStatusWithErrors(runID, false)
+}
+
+func checkGHRunStatusWithErrors(runID string, strict bool) (resolved, escalated bool, reason string, err error) {
 	// Run: gh run view <id> --json status,conclusion,name
 	cmd := exec.Command("gh", "run", "view", runID, "--json", "status,conclusion,name") // #nosec G204 -- runID is a validated GitHub run ID
 	var stdout, stderr bytes.Buffer
@@ -734,6 +765,9 @@ func checkGHRunStatus(runID string) (resolved, escalated bool, reason string, er
 	cmd.Stderr = &stderr
 
 	if runErr := cmd.Run(); runErr != nil {
+		if strict {
+			return false, false, "", fmt.Errorf("gh run view failed: %w: %s", runErr, stderr.String())
+		}
 		// Check if gh CLI is not found
 		if strings.Contains(stderr.String(), "command not found") ||
 			strings.Contains(runErr.Error(), "executable file not found") {
@@ -762,20 +796,38 @@ func checkGHRunStatus(runID string) (resolved, escalated bool, reason string, er
 		case "cancelled", "canceled":
 			return false, true, fmt.Sprintf("workflow '%s' was canceled", status.Name), nil
 		case "skipped":
+			if strict {
+				return false, true, fmt.Sprintf("workflow '%s' was skipped", status.Name), nil
+			}
 			return true, false, fmt.Sprintf("workflow '%s' was skipped", status.Name), nil
+		case "action_required", "neutral", "stale", "startup_failure", "timed_out":
+			return false, true, fmt.Sprintf("workflow '%s' concluded with %s", status.Name, status.Conclusion), nil
 		default:
+			if strict {
+				return false, false, "", fmt.Errorf("unknown workflow conclusion %q", status.Conclusion)
+			}
 			return false, true, fmt.Sprintf("workflow '%s' concluded with %s", status.Name, status.Conclusion), nil
 		}
 	case "in_progress", "queued", "pending", "waiting":
 		return false, false, fmt.Sprintf("workflow '%s' is %s", status.Name, status.Status), nil
 	default:
+		if strict {
+			return false, false, "", fmt.Errorf("unknown workflow status %q", status.Status)
+		}
 		return false, false, fmt.Sprintf("workflow '%s' status: %s", status.Name, status.Status), nil
 	}
 }
 
 // checkGHPR checks a GitHub pull request gate
 func checkGHPR(gate *types.Issue) (resolved, escalated bool, reason string, err error) {
+	return checkGHPRWithErrors(gate, false)
+}
+
+func checkGHPRWithErrors(gate *types.Issue, strict bool) (resolved, escalated bool, reason string, err error) {
 	if gate.AwaitID == "" {
+		if strict {
+			return false, false, "", fmt.Errorf("no PR number specified")
+		}
 		return false, false, "no PR number specified", nil
 	}
 
@@ -786,6 +838,9 @@ func checkGHPR(gate *types.Issue) (resolved, escalated bool, reason string, err 
 	cmd.Stderr = &stderr
 
 	if runErr := cmd.Run(); runErr != nil {
+		if strict {
+			return false, false, "", fmt.Errorf("gh pr view failed: %w: %s", runErr, stderr.String())
+		}
 		// Check if gh CLI is not found
 		if strings.Contains(stderr.String(), "command not found") ||
 			strings.Contains(runErr.Error(), "executable file not found") {
@@ -812,6 +867,9 @@ func checkGHPR(gate *types.Issue) (resolved, escalated bool, reason string, err 
 	case "OPEN":
 		return false, false, fmt.Sprintf("PR '%s' is still open", status.Title), nil
 	default:
+		if strict {
+			return false, false, "", fmt.Errorf("unknown PR state %q", status.State)
+		}
 		return false, false, fmt.Sprintf("PR '%s' state: %s", status.Title, status.State), nil
 	}
 }

@@ -33,7 +33,8 @@ func PromoteFromEphemeralInTx(ctx context.Context, tx *sql.Tx, id string, actor 
 	if err := PrepareIssueForInsert(issue, bc.CustomStatuses, bc.CustomTypes); err != nil {
 		return fmt.Errorf("promote wisp to issues: %w", err)
 	}
-	if _, err := InsertIssueIfNew(ctx, tx, "issues", issue, false); err != nil {
+	_, exactID, err := InsertIssueIfNew(ctx, tx, "issues", issue, false)
+	if err != nil {
 		return fmt.Errorf("promote wisp to issues: %w", err)
 	}
 
@@ -53,6 +54,15 @@ func PromoteFromEphemeralInTx(ctx context.Context, tx *sql.Tx, id string, actor 
 		FROM wisp_dependencies WHERE issue_id = ?
 	`, id); err != nil {
 		return fmt.Errorf("copy dependencies for promoted wisp %s: %w", id, err)
+	}
+	// Capture after a successful copy, while all original edges still exist.
+	if _, _, err := BumpRemovalCloseGuardsInTx(ctx, tx, nil, []string{id}); err != nil {
+		return fmt.Errorf("capture close guards before promoting %s: %w", id, err)
+	}
+	if exactID != id {
+		if _, _, err := BumpRemovalCloseGuardsInTx(ctx, tx, []string{exactID}, nil); err != nil {
+			return fmt.Errorf("capture close guards for promoted issue %s: %w", exactID, err)
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM wisp_dependencies WHERE issue_id = ?`, id); err != nil {
 		return fmt.Errorf("delete copied wisp dependencies for promoted wisp %s: %w", id, err)

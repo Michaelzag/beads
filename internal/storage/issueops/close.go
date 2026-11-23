@@ -30,15 +30,29 @@ func closeIssueInTx(ctx context.Context, tx *sql.Tx, id string, reason, actor, s
 	isWisp := IsActiveWispInTx(ctx, tx, id)
 	issueTable, _, eventTable, _ := WispTableRouting(isWisp)
 
+	// Use the stored spelling for the exact guard key even if SQL collation
+	// permits ordinary close to look the issue up under another spelling.
+	var exactID string
+	if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT id FROM %s WHERE id = ?`, issueTable), id).Scan(&exactID); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("issue not found: %s", id)
+		}
+		return nil, fmt.Errorf("failed to check issue existence: %w", err)
+	}
+
 	var affectedIssues, affectedWisps []string
 	var aerr error
 	if isWisp {
-		affectedIssues, affectedWisps, aerr = AffectedByStatusChangeForWispInTx(ctx, tx, id)
+		affectedIssues, affectedWisps, aerr = AffectedByStatusChangeForWispInTx(ctx, tx, exactID)
 	} else {
-		affectedIssues, affectedWisps, aerr = AffectedByStatusChangeInTx(ctx, tx, id)
+		affectedIssues, affectedWisps, aerr = AffectedByStatusChangeInTx(ctx, tx, exactID)
 	}
 	if aerr != nil {
 		return nil, fmt.Errorf("affected by close for %s: %w", id, aerr)
+	}
+	guardIDs, err := statusCloseGuardIDsInTx(ctx, tx, exactID, affectedIssues, affectedWisps)
+	if err != nil {
+		return nil, err
 	}
 
 	now := time.Now().UTC()
@@ -70,6 +84,10 @@ func closeIssueInTx(ctx context.Context, tx *sql.Tx, id string, reason, actor, s
 			return &CloseResult{IsWisp: isWisp}, nil
 		}
 		return nil, fmt.Errorf("failed to close issue: %s", id)
+	}
+
+	if err := BumpCloseGuardsInTx(ctx, tx, guardIDs...); err != nil {
+		return nil, err
 	}
 
 	if recordEvent {

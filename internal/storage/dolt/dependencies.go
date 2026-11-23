@@ -52,7 +52,7 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac
 		return err
 	}
 	// GH#2455: Use explicit DOLT_ADD to avoid sweeping up stale config changes.
-	return s.doltAddAndCommit(ctx, []string{"dependencies"}, "dependency: add "+string(dep.Type)+" "+dep.IssueID+" -> "+dep.DependsOnID)
+	return s.doltAddAndCommit(ctx, []string{"dependencies", "issues", "metadata"}, "dependency: add "+string(dep.Type)+" "+dep.IssueID+" -> "+dep.DependsOnID)
 }
 
 // RemoveDependency removes a dependency between two issues.
@@ -85,7 +85,7 @@ func (s *DoltStore) RemoveDependency(ctx context.Context, issueID, dependsOnID s
 		return fmt.Errorf("sql commit: %w", err)
 	}
 	// GH#2455: Use explicit DOLT_ADD to avoid sweeping up stale config changes.
-	if err := s.doltAddAndCommit(ctx, []string{"dependencies"}, "dependency: remove "+issueID+" -> "+dependsOnID); err != nil {
+	if err := s.doltAddAndCommit(ctx, []string{"dependencies", "issues", "metadata"}, "dependency: remove "+issueID+" -> "+dependsOnID); err != nil {
 		return err
 	}
 	return nil

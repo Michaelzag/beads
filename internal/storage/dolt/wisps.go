@@ -224,7 +224,7 @@ func (s *DoltStore) deleteWisp(ctx context.Context, id string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	affectedIssues, affectedWisps, aerr := issueops.AffectedByDeletionInTx(ctx, tx, nil, []string{id})
+	affectedIssues, affectedWisps, aerr := issueops.BumpRemovalCloseGuardsInTx(ctx, tx, nil, []string{id})
 	if aerr != nil {
 		return fmt.Errorf("affected by wisp delete for %s: %w", id, aerr)
 	}
@@ -297,7 +297,7 @@ func (s *DoltStore) deleteWispBatchTx(ctx context.Context, ids []string) (int, e
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	affectedIssues, affectedWisps, aerr := issueops.AffectedByDeletionInTx(ctx, tx, nil, ids)
+	affectedIssues, affectedWisps, aerr := issueops.BumpRemovalCloseGuardsInTx(ctx, tx, nil, ids)
 	if aerr != nil {
 		return 0, fmt.Errorf("affected by batched wisp delete: %w", aerr)
 	}
@@ -536,6 +536,20 @@ func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency
 
 	kind := issueops.ClassifyDepTarget(ctx, tx, dep, isCrossPrefix)
 	targetCol := kind.Column()
+	sourceID, targetID := dep.IssueID, dep.DependsOnID
+	if err := tx.QueryRowContext(ctx, "SELECT id FROM wisps WHERE id = ?", dep.IssueID).Scan(&sourceID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("resolve wisp dependency source %s: %w", dep.IssueID, err)
+	}
+	if kind != issueops.DepTargetExternal {
+		table := "issues"
+		if kind == issueops.DepTargetWisp {
+			table = "wisps"
+		}
+		//nolint:gosec // G201: table is one of two hardcoded constants
+		if err := tx.QueryRowContext(ctx, fmt.Sprintf("SELECT id FROM %s WHERE id = ?", table), dep.DependsOnID).Scan(&targetID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("resolve wisp dependency target %s: %w", dep.DependsOnID, err)
+		}
+	}
 
 	// Check for existing dependency to prevent silent type overwrites.
 	var existingType string
@@ -546,6 +560,13 @@ func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency
 	if err == nil {
 		if existingType == string(dep.Type) {
 			// Same type — idempotent; update metadata in case it changed
+			beforeIssues, beforeWisps, err := issueops.AffectedByDepChangeForWispInTx(ctx, tx, sourceID, targetID, dep.Type)
+			if err != nil {
+				return fmt.Errorf("affected by update wisp dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)
+			}
+			if err := issueops.BumpDependencyCloseGuardsInTx(ctx, tx, sourceID, targetID, beforeIssues, beforeWisps, []string{dep.IssueID, dep.DependsOnID}, nil); err != nil {
+				return err
+			}
 			//nolint:gosec // G201: targetCol from DepTargetKind.Column()
 			if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 				UPDATE wisp_dependencies SET metadata = ? WHERE issue_id = ? AND %s = ?
@@ -560,6 +581,11 @@ func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency
 		return fmt.Errorf("failed to check existing wisp dependency: %w", err)
 	}
 
+	beforeIssues, beforeWisps, err := issueops.AffectedByDepChangeForWispInTx(ctx, tx, sourceID, targetID, dep.Type)
+	if err != nil {
+		return fmt.Errorf("affected before add wisp dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)
+	}
+
 	//nolint:gosec // G201: targetCol from DepTargetKind.Column()
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO wisp_dependencies (issue_id, %s, type, created_at, created_by, metadata, thread_id)
@@ -568,9 +594,13 @@ func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency
 		return fmt.Errorf("failed to add wisp dependency: %w", err)
 	}
 
-	affectedIssues, affectedWisps, aerr := issueops.AffectedByDepChangeForWispInTx(ctx, tx, dep.IssueID, dep.DependsOnID, dep.Type)
+	affectedIssues, affectedWisps, aerr := issueops.AffectedByDepChangeForWispInTx(ctx, tx, sourceID, targetID, dep.Type)
 	if aerr != nil {
 		return fmt.Errorf("affected by add wisp dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, aerr)
+	}
+	beforeIssues = append(beforeIssues, dep.IssueID, dep.DependsOnID)
+	if err := issueops.BumpDependencyCloseGuardsInTx(ctx, tx, sourceID, targetID, beforeIssues, beforeWisps, affectedIssues, affectedWisps); err != nil {
+		return err
 	}
 	if err := issueops.RecomputeIsBlockedInTx(ctx, tx, affectedIssues, affectedWisps); err != nil {
 		return fmt.Errorf("recompute is_blocked after add wisp dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)

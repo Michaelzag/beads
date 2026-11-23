@@ -35,6 +35,12 @@ func newDoltStore(ctx context.Context, cfg *dolt.Config) (storage.DoltStorage, e
 	return dolt.New(ctx, cfg)
 }
 
+func newCloseClaimStore(ctx context.Context, cfg *dolt.Config) (storage.DoltStorage, error) {
+	cfg.AutoStart = false
+	cfg.CreateIfMissing = false
+	return newDoltStore(ctx, cfg)
+}
+
 // acquireEmbeddedLock returns a no-op lock in non-CGO builds.
 func acquireEmbeddedLock(_ string, _ bool) (util.Unlocker, error) {
 	return util.NoopLock{}, nil

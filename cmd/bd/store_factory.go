@@ -52,6 +52,15 @@ func newDoltStore(ctx context.Context, cfg *dolt.Config) (storage.DoltStorage, e
 	return embeddeddolt.Open(ctx, cfg.BeadsDir, cfg.Database, "main")
 }
 
+func newCloseClaimStore(ctx context.Context, cfg *dolt.Config) (storage.DoltStorage, error) {
+	cfg.AutoStart = false
+	cfg.CreateIfMissing = false
+	if cfg.ServerMode {
+		return dolt.New(ctx, cfg)
+	}
+	return embeddeddolt.OpenForCloseClaim(cfg.BeadsDir, cfg.Database, "main")
+}
+
 // acquireEmbeddedLock acquires an exclusive flock on the embeddeddolt data
 // directory derived from beadsDir. The caller must defer lock.Unlock().
 // Returns a no-op lock when serverMode is true (the server handles its own

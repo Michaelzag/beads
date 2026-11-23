@@ -826,7 +826,9 @@ var rootCmd = &cobra.Command{
 
 		// Ambient staleness warning: if Linear data is stale, warn once per
 		// shell session on stderr. Only fires when LINEAR_API_KEY is set.
-		maybeWarnLinearStaleness(cmd)
+		if cmd.Name() != "close-claim" {
+			maybeWarnLinearStaleness(cmd)
+		}
 
 		if skipsStoreInit {
 			return
@@ -928,22 +930,22 @@ var rootCmd = &cobra.Command{
 			commandSpan.SetAttributes(attribute.String("bd.actor", actor))
 		}
 
-		// Track bd version changes
-		// Best-effort tracking - failures are silent
-		trackBdVersion()
+		isCloseClaim := cmd.Name() == "close-claim"
+		receiptOnly := false
+		if isCloseClaim {
+			receiptOnly, _ = cmd.Flags().GetBool("receipt-only")
+		}
+		// The close-claim protocol must not run unrelated maintenance on
+		// lookup or replay. It expects an already provisioned database.
+		if !isCloseClaim {
+			trackBdVersion()
+			// Run automatic migrations before opening the main store, including
+			// for ordinary read-only commands (bd-jgxi).
+			autoMigrateOnVersionBump(beadsDir)
+		}
 
-		// Check if this is a read-only command (GH#804)
-		// Read-only commands open the store in read-only mode to avoid modifying
-		// the database (which breaks file watchers).
-		useReadOnly := isReadOnlyCommand(cmd.Name())
-
-		// Auto-migrate database on version bump (bd-jgxi).
-		// Runs for ALL commands (including read-only ones) because the migration
-		// opens its own store connection, writes the version metadata, commits it,
-		// and closes BEFORE the main store is opened. This ensures bd doctor and
-		// read-only commands see the correct version after a CLI upgrade.
-
-		autoMigrateOnVersionBump(beadsDir)
+		// Read-only commands avoid modifying the database on store open (GH#804).
+		useReadOnly := isReadOnlyCommand(cmd.Name()) || receiptOnly
 
 		// Initialize direct storage access
 		var err error
@@ -952,7 +954,9 @@ var rootCmd = &cobra.Command{
 		// on a different filesystem (e.g., ext4 for performance on WSL).
 		doltPath := doltserver.ResolveDoltDir(beadsDir)
 		doltCfg := &dolt.Config{
-			ReadOnly: useReadOnly,
+			// ReadOnly suppresses server-side schema/bootstrap maintenance.
+			// The close-claim backend itself selects the transaction mode.
+			ReadOnly: useReadOnly || isCloseClaim,
 			BeadsDir: beadsDir,
 		}
 
@@ -1029,7 +1033,11 @@ var rootCmd = &cobra.Command{
 
 		// Keep standalone CLI auto-start behavior centralized so doctor and
 		// other helper paths stay in lockstep with the main command path.
-		dolt.ApplyCLIAutoStart(beadsDir, doltCfg)
+		if !isCloseClaim {
+			dolt.ApplyCLIAutoStart(beadsDir, doltCfg)
+		} else if proxiedServerMode {
+			FatalError("configured store does not support close-claim")
+		}
 
 		if proxiedServerMode {
 			p, err := newProxiedServerUOWProvider(rootCtx, beadsDir)
@@ -1063,7 +1071,11 @@ var rootCmd = &cobra.Command{
 		// Removing them WILL cause unrecoverable data corruption and data loss.
 		// Dolt manages these files itself; external interference is never safe.
 
-		store, err = newDoltStore(rootCtx, doltCfg)
+		if isCloseClaim {
+			store, err = newCloseClaimStore(rootCtx, doltCfg)
+		} else {
+			store, err = newDoltStore(rootCtx, doltCfg)
+		}
 
 		// Track final read-only state for staleness checks (GH#1089)
 		storeIsReadOnly = doltCfg.ReadOnly
@@ -1098,7 +1110,7 @@ var rootCmd = &cobra.Command{
 		// Skip auto-import when the user is explicitly running "bd import" —
 		// the import command handles JSONL files itself and auto-importing
 		// first would interfere (double-import / upsert confusion).
-		if shouldRunAutoImportJSONL(cmd, store, useReadOnly, globalFlag, doltCfg.ServerMode) {
+		if !isCloseClaim && shouldRunAutoImportJSONL(cmd, store, useReadOnly, globalFlag, doltCfg.ServerMode) {
 			maybeAutoImportJSONL(rootCtx, store, beadsDir)
 		}
 
@@ -1106,13 +1118,13 @@ var rootCmd = &cobra.Command{
 		// Skip for read-only commands since they can't corrupt data.
 		// Skip for --global: the global database uses a sentinel project ID
 		// that won't match any project's metadata.json.
-		if !useReadOnly && !globalFlag && os.Getenv("BEADS_SKIP_IDENTITY_CHECK") != "1" {
+		if !isCloseClaim && !useReadOnly && !globalFlag && os.Getenv("BEADS_SKIP_IDENTITY_CHECK") != "1" {
 			validateWorkspaceIdentity(rootCtx, beadsDir)
 		}
 
 		// Initialize hook runner
 		// dbPath is .beads/something.db, so workspace root is parent of .beads
-		if dbPath != "" {
+		if !isCloseClaim && dbPath != "" {
 			beadsDir := filepath.Dir(dbPath)
 			hookRunner = hooks.NewRunner(filepath.Join(beadsDir, "hooks"))
 		}
@@ -1122,17 +1134,19 @@ var rootCmd = &cobra.Command{
 		// Set BD_NO_HOOKS=1 to disable all hook firing (useful for
 		// bulk imports, migrations, or environments where hooks
 		// should not run).
-		if hookRunner != nil && store != nil && !config.GetBool("no-hooks") {
+		if !isCloseClaim && hookRunner != nil && store != nil && !config.GetBool("no-hooks") {
 			store = storage.NewHookFiringStore(store, hookRunner)
 		}
 
 		// Warn if multiple databases detected in directory hierarchy
-		warnMultipleDatabases(dbPath)
+		if !isCloseClaim {
+			warnMultipleDatabases(dbPath)
+		}
 
 		// Load molecule templates from hierarchical catalog locations
 		// Templates are loaded after auto-import to ensure the database is up-to-date.
 		// Skip for import command to avoid conflicts during import operations.
-		if cmd.Name() != "import" && store != nil {
+		if !isCloseClaim && cmd.Name() != "import" && store != nil {
 			beadsDir := filepath.Dir(dbPath)
 			loader := molecules.NewLoader(store)
 			if result, err := loader.LoadAll(rootCtx, beadsDir); err != nil {
@@ -1156,7 +1170,7 @@ var rootCmd = &cobra.Command{
 				_ = uowProvider.Close(rootCtx)
 				uowProvider = nil
 			}
-		} else {
+		} else if cmd.Name() != "close-claim" {
 			// Dolt auto-commit: after a successful write command (and after final flush),
 			// create a Dolt commit so changes don't remain only in the working set.
 			if commandDidWrite.Load() && !commandDidExplicitDoltCommit {
@@ -1211,6 +1225,9 @@ var rootCmd = &cobra.Command{
 				maybeAutoPush(rootCtx)
 			}
 
+		}
+
+		if !proxiedServerMode {
 			// Signal that store is closing (prevents background flush from accessing closed store)
 			storeMutex.Lock()
 			storeActive = false

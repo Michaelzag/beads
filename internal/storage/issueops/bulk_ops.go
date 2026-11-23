@@ -186,13 +186,17 @@ func DeleteIssuesBySourceRepoInTx(ctx context.Context, tx *sql.Tx, sourceRepo st
 		}
 		issueIDs = append(issueIDs, id)
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf("iterate source-repo issues: %w", err)
+	}
 	_ = rows.Close()
 
 	if len(issueIDs) == 0 {
 		return 0, nil
 	}
 
-	affectedIssues, affectedWisps, aerr := AffectedByDeletionInTx(ctx, tx, issueIDs, nil)
+	affectedIssues, affectedWisps, aerr := BumpRemovalCloseGuardsInTx(ctx, tx, issueIDs, nil)
 	if aerr != nil {
 		return 0, fmt.Errorf("affected by source-repo delete: %w", aerr)
 	}
@@ -216,7 +220,20 @@ func DeleteIssuesBySourceRepoInTx(ctx context.Context, tx *sql.Tx, sourceRepo st
 
 //nolint:gosec // G201: table names are hardcoded
 func UpdateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, issue *types.Issue, actor string) error {
-	if IsActiveWispInTx(ctx, tx, oldID) {
+	isWisp := IsActiveWispInTx(ctx, tx, oldID)
+	var issues, wisps []string
+	if isWisp {
+		wisps = []string{oldID}
+	} else {
+		issues = []string{oldID}
+	}
+	if _, _, err := BumpRemovalCloseGuardsInTx(ctx, tx, issues, wisps); err != nil {
+		return fmt.Errorf("capture close guards before renaming %s: %w", oldID, err)
+	}
+	if err := BumpCloseGuardsInTx(ctx, tx, newID); err != nil {
+		return err
+	}
+	if isWisp {
 		return updateWispIDInTx(ctx, tx, oldID, newID, issue, actor)
 	}
 	return updateIssueIDInTx(ctx, tx, oldID, newID, issue, actor)

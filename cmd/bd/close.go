@@ -446,6 +446,10 @@ func isMachineCheckableGate(issue *types.Issue) bool {
 // checkGateSatisfaction checks whether a gate issue's condition is satisfied.
 // Returns nil if the gate is satisfied (or not a machine-checkable gate), or an error describing why it cannot be closed.
 func checkGateSatisfaction(issue *types.Issue) error {
+	return checkGateSatisfactionWithRunIDPersistence(issue, true)
+}
+
+func checkGateSatisfactionWithRunIDPersistence(issue *types.Issue, persistRunID bool) error {
 	if !isMachineCheckableGate(issue) {
 		return nil
 	}
@@ -457,7 +461,7 @@ func checkGateSatisfaction(issue *types.Issue) error {
 
 	switch {
 	case strings.HasPrefix(issue.AwaitType, "gh:run"):
-		resolved, escalated, reason, err = checkGHRun(issue, true)
+		resolved, escalated, reason, err = checkGHRun(issue, persistRunID)
 	case strings.HasPrefix(issue.AwaitType, "gh:pr"):
 		resolved, escalated, reason, err = checkGHPR(issue)
 	case issue.AwaitType == "timer":

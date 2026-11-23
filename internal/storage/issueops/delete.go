@@ -16,6 +16,73 @@ const deleteBatchSize = 50
 // discovered during recursive dependent traversal.
 const maxRecursiveResults = 10000
 
+// BumpRemovalCloseGuardsInTx captures the graph before a delete, rename, or
+// table move can remove the original links. This includes parents and other
+// outgoing endpoints, which are not in the blocker recomputation set.
+//
+//nolint:gosec // G201: table and IN markers are built from hardcoded values.
+func BumpRemovalCloseGuardsInTx(ctx context.Context, tx *sql.Tx, issueIDs, wispIDs []string) ([]string, []string, error) {
+	affectedIssues, affectedWisps, err := AffectedByDeletionInTx(ctx, tx, issueIDs, wispIDs)
+	if err != nil {
+		return nil, nil, err
+	}
+	ids := append(append([]string{}, issueIDs...), wispIDs...)
+	ids = append(ids, affectedIssues...)
+	ids = append(ids, affectedWisps...)
+	for _, bucket := range []struct {
+		table string
+		ids   []string
+	}{
+		{"dependencies", issueIDs},
+		{"wisp_dependencies", wispIDs},
+	} {
+		if len(bucket.ids) == 0 {
+			continue
+		}
+		records, err := GetDependencyRecordsForIssuesFromTableInTx(ctx, tx, bucket.table, bucket.ids)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, deps := range records {
+			for _, dep := range deps {
+				ids = append(ids, dep.DependsOnID)
+			}
+		}
+	}
+	// Dependency rows and callers may carry a collation alias rather than
+	// the stored spelling. Include actual issue keys without discarding inputs.
+	lookupIDs := ids
+	for _, table := range []string{"issues", "wisps"} {
+		for start := 0; start < len(lookupIDs); start += deleteBatchSize {
+			end := min(start+deleteBatchSize, len(lookupIDs))
+			inClause, args := buildSQLInClause(lookupIDs[start:end])
+			rows, err := tx.QueryContext(ctx, fmt.Sprintf("SELECT id FROM %s WHERE id IN (%s)", table, inClause), args...)
+			if err != nil {
+				if optionalBlockedTable(table) && isTableNotExistError(err) {
+					break
+				}
+				return nil, nil, fmt.Errorf("resolve close guard IDs from %s: %w", table, err)
+			}
+			for rows.Next() {
+				var id string
+				if err := rows.Scan(&id); err != nil {
+					_ = rows.Close()
+					return nil, nil, err
+				}
+				ids = append(ids, id)
+			}
+			_ = rows.Close()
+			if err := rows.Err(); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	if err := BumpCloseGuardsInTx(ctx, tx, ids...); err != nil {
+		return nil, nil, err
+	}
+	return affectedIssues, affectedWisps, nil
+}
+
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
 func DeleteIssueInTx(ctx context.Context, tx *sql.Tx, id string) error {
 	isWisp := IsActiveWispInTx(ctx, tx, id)
@@ -26,7 +93,7 @@ func DeleteIssueInTx(ctx context.Context, tx *sql.Tx, id string) error {
 	} else {
 		deletedIssues = []string{id}
 	}
-	affectedIssues, affectedWisps, aerr := AffectedByDeletionInTx(ctx, tx, deletedIssues, deletedWisps)
+	affectedIssues, affectedWisps, aerr := BumpRemovalCloseGuardsInTx(ctx, tx, deletedIssues, deletedWisps)
 	if aerr != nil {
 		return fmt.Errorf("affected by delete for %s: %w", id, aerr)
 	}
@@ -230,7 +297,7 @@ func DeleteIssuesInTx(ctx context.Context, tx *sql.Tx, ids []string, cascade boo
 		return result, nil
 	}
 
-	affectedIssues, affectedWisps, aerr := AffectedByDeletionInTx(ctx, tx, finalRegularIDs, allWispIDs)
+	affectedIssues, affectedWisps, aerr := BumpRemovalCloseGuardsInTx(ctx, tx, finalRegularIDs, allWispIDs)
 	if aerr != nil {
 		return nil, fmt.Errorf("affected by batch delete: %w", aerr)
 	}

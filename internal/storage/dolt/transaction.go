@@ -18,18 +18,9 @@ import (
 
 // doltTransaction implements storage.Transaction for Dolt
 type doltTransaction struct {
-	regularTx *sql.Tx
-	ignoredTx *sql.Tx
-	store     *DoltStore
-	dirty     versioncontrolops.DirtyTableTracker
-}
-
-func (t *doltTransaction) txFor(table string) *sql.Tx {
-	if table == "wisps" || strings.HasPrefix(table, "wisp_") ||
-		table == "local_metadata" || table == "repo_mtimes" {
-		return t.ignoredTx
-	}
-	return t.regularTx
+	tx    *sql.Tx
+	store *DoltStore
+	dirty versioncontrolops.DirtyTableTracker
 }
 
 // isActiveWisp checks if an ID exists in the wisps table within the transaction.
@@ -37,7 +28,7 @@ func (t *doltTransaction) txFor(table string) *sql.Tx {
 // sees uncommitted wisps. Handles both -wisp- pattern and explicit-ID ephemerals (GH#2053).
 func (t *doltTransaction) isActiveWisp(ctx context.Context, id string) bool {
 	var exists int
-	err := t.ignoredTx.QueryRowContext(ctx, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1", id).Scan(&exists)
+	err := t.tx.QueryRowContext(ctx, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1", id).Scan(&exists)
 	return err == nil
 }
 
@@ -47,10 +38,9 @@ func (t *doltTransaction) CreateIssueImport(ctx context.Context, issue *types.Is
 	return t.CreateIssue(ctx, issue, actor)
 }
 
-// RunInTransaction executes a function within a database transaction.
-// The commitMsg is used for the DOLT_COMMIT that occurs inside the transaction,
-// making the write atomically visible in Dolt's version history.
-// Wisp routing is handled within individual transaction methods based on ID/Ephemeral flag.
+// RunInTransaction executes a function in a single SQL working-set transaction.
+// Regular and ignored writes publish together; commitMsg is used afterward to
+// record the tracked tables in Dolt history.
 func (s *DoltStore) RunInTransaction(ctx context.Context, commitMsg string, fn func(tx storage.Transaction) error) error {
 	return s.withRetry(ctx, func() error {
 		return s.runDoltTransaction(ctx, commitMsg, fn)
@@ -58,11 +48,9 @@ func (s *DoltStore) RunInTransaction(ctx context.Context, commitMsg string, fn f
 }
 
 func (s *DoltStore) runDoltTransaction(ctx context.Context, commitMsg string, fn func(tx storage.Transaction) error) error {
-	// Pin a single connection for the entire operation: SQL transaction,
-	// config protection, and DOLT_COMMIT must all run on the same Dolt
-	// session. Each pool connection has an independent working set in Dolt
-	// SQL server mode, so mixing connections causes DOLT_COMMIT to see
-	// stale or unrelated changes. (GH#2455)
+	// Pin the connection through SQL COMMIT and selective version staging.
+	// Staging on a different session can pick up stale or unrelated changes
+	// (GH#2455).
 
 	// Snapshot pool stats before acquisition to detect pool-wait events (GH#3140).
 	statsBefore := s.db.Stats()
@@ -88,88 +76,26 @@ func (s *DoltStore) runDoltTransaction(ctx context.Context, commitMsg string, fn
 	}
 	defer conn.Close()
 
-	var currentBranch string
-	if err := conn.QueryRowContext(ctx, "SELECT active_branch()").Scan(&currentBranch); err != nil {
-		return fmt.Errorf("failed to read active branch: %w", err)
-	}
-
-	regularTx, err := conn.BeginTx(ctx, nil)
+	sqlTx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("failed to begin regular tx: %w", err)
+		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
+	defer func() { _ = sqlTx.Rollback() }()
 
-	ignoredDB, ignoredConn, ignoredTx, err := s.beginIgnoredTxOnBranch(ctx, currentBranch)
-	if err != nil {
-		_ = regularTx.Rollback()
-		return err
-	}
-	defer ignoredDB.Close()
-	defer ignoredConn.Close()
-
-	tx := &doltTransaction{regularTx: regularTx, ignoredTx: ignoredTx, store: s}
-
-	defer func() {
-		if r := recover(); r != nil {
-			_ = regularTx.Rollback()
-			_ = ignoredTx.Rollback()
-			panic(r)
-		}
-	}()
-
+	// Ignored mutations may bump a guard in metadata or update a permanent
+	// is_blocked projection. Those writes must share the SQL transaction with
+	// regular mutations, even though wisp-only changes do not trigger staging.
+	tx := &doltTransaction{tx: sqlTx, store: s}
 	if err := fn(tx); err != nil {
-		_ = regularTx.Rollback()
-		_ = ignoredTx.Rollback()
 		return err
 	}
 
-	if err := regularTx.Commit(); err != nil {
-		_ = ignoredTx.Rollback()
-		return fmt.Errorf("sql commit (regular): %w", err)
+	// Publish the working set before calling DOLT_ADD/DOLT_COMMIT. Do not
+	// move version publication into the generic SQL transaction (#hq-3paz0m).
+	if err := sqlTx.Commit(); err != nil {
+		return fmt.Errorf("sql commit: %w", err)
 	}
-
-	if err := versioncontrolops.StageAndCommit(ctx, conn, tx.dirty.DirtyTables(), commitMsg, s.commitAuthorString()); err != nil {
-		_ = ignoredTx.Rollback()
-		return err
-	}
-
-	if err := ignoredTx.Commit(); err != nil {
-		return fmt.Errorf("sql commit (ignored, regular already committed): %w", err)
-	}
-	return nil
-}
-
-func (s *DoltStore) beginIgnoredTxOnBranch(ctx context.Context, branch string) (*sql.DB, *sql.Conn, *sql.Tx, error) {
-	// Use an independent single-connection pool for ignored tables. Reusing the
-	// main pool can deadlock when MaxOpenConns=1, and each Dolt SQL session has
-	// its own active branch. This intentionally pays one extra connection setup
-	// for mixed regular/ignored writes so the ignored transaction can be checked
-	// out to the regular transaction's branch before writes.
-	db, err := sql.Open("mysql", s.connStr)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to open ignored tx connection: %w", err)
-	}
-	db.SetMaxOpenConns(1)
-
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		_ = db.Close()
-		return nil, nil, nil, fmt.Errorf("failed to acquire ignored tx connection: %w", err)
-	}
-
-	if _, err := conn.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", branch); err != nil {
-		_ = conn.Close()
-		_ = db.Close()
-		return nil, nil, nil, fmt.Errorf("failed to checkout ignored tx branch %s: %w", branch, err)
-	}
-
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		_ = conn.Close()
-		_ = db.Close()
-		return nil, nil, nil, fmt.Errorf("failed to begin ignored tx: %w", err)
-	}
-
-	return db, conn, tx, nil
+	return versioncontrolops.StageAndCommit(ctx, conn, tx.dirty.DirtyTables(), commitMsg, s.commitAuthorString())
 }
 
 // isDoltNothingToCommit returns true if the error indicates there were no
@@ -185,22 +111,16 @@ func (t *doltTransaction) CreateIssue(ctx context.Context, issue *types.Issue, a
 		return fmt.Errorf("issue must not be nil")
 	}
 
+	bc, err := issueops.NewBatchContext(ctx, t.tx, storage.BatchCreateOptions{SkipPrefixValidation: true})
+	if err != nil {
+		return err
+	}
+	result, err := issueops.CreateIssueInTxWithResult(ctx, t.tx, bc, issue, actor)
+	if err != nil {
+		return err
+	}
 	if issueops.IsWisp(issue) {
-		bc, err := issueops.NewBatchContext(ctx, t.ignoredTx, storage.BatchCreateOptions{SkipPrefixValidation: true})
-		if err != nil {
-			return err
-		}
-		_, err = issueops.CreateIssueInTxWithResult(ctx, t.ignoredTx, bc, issue, actor)
-		return err
-	}
-
-	bc, err := issueops.NewBatchContext(ctx, t.regularTx, storage.BatchCreateOptions{SkipPrefixValidation: true})
-	if err != nil {
-		return err
-	}
-	result, err := issueops.CreateIssueInTxWithResult(ctx, t.regularTx, bc, issue, actor)
-	if err != nil {
-		return err
+		return nil
 	}
 	for table := range issueops.CreateIssueDirtyTables(ctx, issue, result) {
 		t.dirty.MarkDirty(table)
@@ -214,8 +134,8 @@ func (t *doltTransaction) CreateIssues(ctx context.Context, issues []*types.Issu
 		return nil
 	}
 
-	// This must run before splitting regular issues from wisps: the shared
-	// create helper below only sees the regular subset.
+	// Preserve same-batch cross-bucket validation before separating the
+	// tracked writes from the working-set-only writes.
 	if err := issueops.ValidateCreateIssuesMixedBucketDependencies(issues); err != nil {
 		return err
 	}
@@ -231,7 +151,7 @@ func (t *doltTransaction) CreateIssues(ctx context.Context, issues []*types.Issu
 	}
 
 	if len(regularIssues) > 0 {
-		result, err := issueops.CreateIssuesInTxWithResult(ctx, t.regularTx, regularIssues, actor, storage.BatchCreateOptions{
+		result, err := issueops.CreateIssuesInTxWithResult(ctx, t.tx, regularIssues, actor, storage.BatchCreateOptions{
 			OrphanHandling:       storage.OrphanAllow,
 			SkipPrefixValidation: true,
 		})
@@ -244,7 +164,7 @@ func (t *doltTransaction) CreateIssues(ctx context.Context, issues []*types.Issu
 	}
 
 	if len(wispIssues) > 0 {
-		if _, err := issueops.CreateIssuesInTxWithResult(ctx, t.ignoredTx, wispIssues, actor, storage.BatchCreateOptions{
+		if err := issueops.CreateIssuesInTx(ctx, t.tx, wispIssues, actor, storage.BatchCreateOptions{
 			OrphanHandling:       storage.OrphanAllow,
 			SkipPrefixValidation: true,
 		}); err != nil {
@@ -261,7 +181,7 @@ func (t *doltTransaction) GetIssue(ctx context.Context, id string) (*types.Issue
 	if t.isActiveWisp(ctx, id) {
 		table = "wisps"
 	}
-	return scanIssueTxFromTable(ctx, t.txFor(table), table, id)
+	return scanIssueTxFromTable(ctx, t.tx, table, id)
 }
 
 // SearchIssues searches for issues within the transaction.
@@ -569,7 +489,7 @@ func (t *doltTransaction) SearchIssues(ctx context.Context, query string, filter
 	}
 
 	//nolint:gosec // G201: table is hardcoded, whereSQL is parameterized
-	rows, err := t.txFor(table).QueryContext(ctx, fmt.Sprintf(`
+	rows, err := t.tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT id FROM %s %s ORDER BY priority ASC, created_at DESC %s
 	`, table, whereSQL, limitSQL), args...)
 	if err != nil {
@@ -618,10 +538,13 @@ func (t *doltTransaction) UpdateIssue(ctx context.Context, id string, updates ma
 		}
 	}
 
-	if _, err := issueops.UpdateIssueWithoutEventInTx(ctx, t.txFor(table), id, updates, actor); err != nil {
+	if _, err := issueops.UpdateIssueWithoutEventInTx(ctx, t.tx, id, updates, actor); err != nil {
 		return wrapExecError("update issue in tx", err)
 	}
 	t.dirty.MarkDirty(table)
+	if table == "issues" {
+		t.dirty.MarkDirty("metadata")
+	}
 	return nil
 }
 
@@ -631,10 +554,13 @@ func (t *doltTransaction) CloseIssue(ctx context.Context, id string, reason stri
 		table = "wisps"
 	}
 
-	if _, err := issueops.CloseIssueWithoutEventInTx(ctx, t.txFor(table), id, reason, actor, session); err != nil {
+	if _, err := issueops.CloseIssueWithoutEventInTx(ctx, t.tx, id, reason, actor, session); err != nil {
 		return wrapExecError("close issue in tx", err)
 	}
 	t.dirty.MarkDirty(table)
+	if table == "issues" {
+		t.dirty.MarkDirty("metadata")
+	}
 	return nil
 }
 
@@ -643,10 +569,14 @@ func (t *doltTransaction) DeleteIssue(ctx context.Context, id string) error {
 	if t.isActiveWisp(ctx, id) {
 		table = "wisps"
 	}
-	if err := issueops.DeleteIssueInTx(ctx, t.txFor(table), id); err != nil {
+	if err := issueops.DeleteIssueInTx(ctx, t.tx, id); err != nil {
 		return wrapExecError("delete issue in tx", err)
 	}
-	t.dirty.MarkDirty(table)
+	if table == "issues" {
+		for _, table := range issueDeleteCommitTables {
+			t.dirty.MarkDirty(table)
+		}
+	}
 	return nil
 }
 
@@ -685,10 +615,14 @@ func (t *doltTransaction) AddDependencyWithOptions(ctx context.Context, dep *typ
 		SkipCycleCheck: addOpts.SkipCycleCheck,
 		TargetKind:     &kind,
 	}
-	if err := issueops.AddDependencyInTx(ctx, t.txFor(table), dep, actor, opts); err != nil {
+	if err := issueops.AddDependencyInTx(ctx, t.tx, dep, actor, opts); err != nil {
 		return err
 	}
 	t.dirty.MarkDirty(table)
+	if table == "dependencies" {
+		t.dirty.MarkDirty("issues")
+		t.dirty.MarkDirty("metadata")
+	}
 	return nil
 }
 
@@ -699,7 +633,7 @@ func (t *doltTransaction) GetDependencyRecords(ctx context.Context, issueID stri
 	}
 
 	//nolint:gosec // G201: table is hardcoded
-	rows, err := t.txFor(table).QueryContext(ctx, fmt.Sprintf(`
+	rows, err := t.tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT issue_id, %s AS depends_on_id, type, created_at, created_by, metadata, thread_id
 		FROM %s
 		WHERE issue_id = ?
@@ -733,10 +667,14 @@ func (t *doltTransaction) RemoveDependency(ctx context.Context, issueID, depends
 	if t.isActiveWisp(ctx, issueID) {
 		table = "wisp_dependencies"
 	}
-	if err := issueops.RemoveDependencyInTx(ctx, t.txFor(table), issueID, dependsOnID); err != nil {
+	if err := issueops.RemoveDependencyInTx(ctx, t.tx, issueID, dependsOnID); err != nil {
 		return wrapExecError("remove dependency in tx", err)
 	}
 	t.dirty.MarkDirty(table)
+	if table == "dependencies" {
+		t.dirty.MarkDirty("issues")
+		t.dirty.MarkDirty("metadata")
+	}
 	return nil
 }
 
@@ -747,14 +685,14 @@ func (t *doltTransaction) AddLabel(ctx context.Context, issueID, label, actor st
 		table = "wisp_labels"
 	}
 
-	//nolint:gosec // G201: table is hardcoded
-	_, err := t.txFor(table).ExecContext(ctx, fmt.Sprintf(`
-		INSERT IGNORE INTO %s (issue_id, label) VALUES (?, ?)
-	`, table), issueID, label)
-	if err == nil {
-		t.dirty.MarkDirty(table)
+	if err := issueops.AddLabelWithoutEventInTx(ctx, t.tx, table, issueID, label); err != nil {
+		return wrapExecError("add label in tx", err)
 	}
-	return wrapExecError("add label in tx", err)
+	t.dirty.MarkDirty(table)
+	if table == "labels" && strings.HasPrefix(label, "repo:") {
+		t.dirty.MarkDirty("metadata")
+	}
+	return nil
 }
 
 func (t *doltTransaction) GetLabels(ctx context.Context, issueID string) ([]string, error) {
@@ -764,7 +702,7 @@ func (t *doltTransaction) GetLabels(ctx context.Context, issueID string) ([]stri
 	}
 
 	//nolint:gosec // G201: table is hardcoded
-	rows, err := t.txFor(table).QueryContext(ctx, fmt.Sprintf(`SELECT label FROM %s WHERE issue_id = ? ORDER BY label`, table), issueID)
+	rows, err := t.tx.QueryContext(ctx, fmt.Sprintf(`SELECT label FROM %s WHERE issue_id = ? ORDER BY label`, table), issueID)
 	if err != nil {
 		return nil, wrapQueryError("get labels in tx", err)
 	}
@@ -787,19 +725,20 @@ func (t *doltTransaction) RemoveLabel(ctx context.Context, issueID, label, actor
 		table = "wisp_labels"
 	}
 
-	//nolint:gosec // G201: table is hardcoded
-	_, err := t.txFor(table).ExecContext(ctx, fmt.Sprintf(`
-		DELETE FROM %s WHERE issue_id = ? AND label = ?
-	`, table), issueID, label)
-	if err == nil {
-		t.dirty.MarkDirty(table)
+	if err := issueops.RemoveLabelWithoutEventInTx(ctx, t.tx, table, issueID, label); err != nil {
+		return wrapExecError("remove label in tx", err)
 	}
-	return wrapExecError("remove label in tx", err)
+	t.dirty.MarkDirty(table)
+	if table == "labels" {
+		// SQL may have matched a differently cased stored repo label.
+		t.dirty.MarkDirty("metadata")
+	}
+	return nil
 }
 
 // SetConfig sets a config value within the transaction
 func (t *doltTransaction) SetConfig(ctx context.Context, key, value string) error {
-	_, err := t.regularTx.ExecContext(ctx, `
+	_, err := t.tx.ExecContext(ctx, `
 		INSERT INTO config (`+"`key`"+`, value) VALUES (?, ?)
 		ON DUPLICATE KEY UPDATE value = VALUES(value)
 	`, key, value)
@@ -812,7 +751,7 @@ func (t *doltTransaction) SetConfig(ctx context.Context, key, value string) erro
 // GetConfig gets a config value within the transaction
 func (t *doltTransaction) GetConfig(ctx context.Context, key string) (string, error) {
 	var value string
-	err := t.regularTx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key` = ?", key).Scan(&value)
+	err := t.tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key` = ?", key).Scan(&value)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
@@ -821,7 +760,7 @@ func (t *doltTransaction) GetConfig(ctx context.Context, key string) (string, er
 
 // SetMetadata sets a metadata value within the transaction
 func (t *doltTransaction) SetMetadata(ctx context.Context, key, value string) error {
-	_, err := t.regularTx.ExecContext(ctx, `
+	_, err := t.tx.ExecContext(ctx, `
 		INSERT INTO metadata (`+"`key`"+`, value) VALUES (?, ?)
 		ON DUPLICATE KEY UPDATE value = VALUES(value)
 	`, key, value)
@@ -834,7 +773,7 @@ func (t *doltTransaction) SetMetadata(ctx context.Context, key, value string) er
 // GetMetadata gets a metadata value within the transaction
 func (t *doltTransaction) GetMetadata(ctx context.Context, key string) (string, error) {
 	var value string
-	err := t.regularTx.QueryRowContext(ctx, "SELECT value FROM metadata WHERE `key` = ?", key).Scan(&value)
+	err := t.tx.QueryRowContext(ctx, "SELECT value FROM metadata WHERE `key` = ?", key).Scan(&value)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
@@ -843,14 +782,14 @@ func (t *doltTransaction) GetMetadata(ctx context.Context, key string) (string, 
 
 // SetLocalMetadata sets a value in the dolt-ignored local_metadata table within the transaction.
 func (t *doltTransaction) SetLocalMetadata(ctx context.Context, key, value string) error {
-	_, err := t.ignoredTx.ExecContext(ctx, "REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)", key, value)
+	_, err := t.tx.ExecContext(ctx, "REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)", key, value)
 	return wrapExecError("set local metadata in tx", err)
 }
 
 // GetLocalMetadata gets a value from the dolt-ignored local_metadata table within the transaction.
 func (t *doltTransaction) GetLocalMetadata(ctx context.Context, key string) (string, error) {
 	var value string
-	err := t.ignoredTx.QueryRowContext(ctx, "SELECT value FROM local_metadata WHERE `key` = ?", key).Scan(&value)
+	err := t.tx.QueryRowContext(ctx, "SELECT value FROM local_metadata WHERE `key` = ?", key).Scan(&value)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
@@ -871,7 +810,7 @@ func (t *doltTransaction) ImportIssueComment(ctx context.Context, issueID, autho
 	createdAt = createdAt.UTC()
 	id := uuid.Must(uuid.NewV7()).String()
 	//nolint:gosec // G201: table is hardcoded
-	_, err = t.txFor(table).ExecContext(ctx, fmt.Sprintf(`
+	_, err = t.tx.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %s (id, issue_id, author, text, created_at)
 		VALUES (?, ?, ?, ?, ?)
 	`, table), id, issueID, author, text, createdAt)
@@ -890,7 +829,7 @@ func (t *doltTransaction) GetIssueComments(ctx context.Context, issueID string) 
 	}
 
 	//nolint:gosec // G201: table is hardcoded
-	rows, err := t.txFor(table).QueryContext(ctx, fmt.Sprintf(`
+	rows, err := t.tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT id, issue_id, author, text, created_at
 		FROM %s
 		WHERE issue_id = ?
@@ -919,7 +858,7 @@ func (t *doltTransaction) AddComment(ctx context.Context, issueID, actor, commen
 	}
 
 	//nolint:gosec // G201: table is hardcoded
-	_, err := t.txFor(table).ExecContext(ctx, fmt.Sprintf(`
+	_, err := t.tx.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %s (issue_id, event_type, actor, comment)
 		VALUES (?, ?, ?, ?)
 	`, table), issueID, types.EventCommented, actor, comment)

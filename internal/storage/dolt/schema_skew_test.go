@@ -66,7 +66,8 @@ func TestCheckForwardDrift_CurrentVersion_NoError(t *testing.T) {
 func TestCheckForwardDrift_EscapeHatch_ReturnsNil(t *testing.T) {
 	t.Setenv("BD_IGNORE_SCHEMA_SKEW", "1")
 
-	store, cleanup := setupTestStore(t)
+	// t.Setenv requires this test to use a serial fixture.
+	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 
 	ctx, cancel := testContext(t)

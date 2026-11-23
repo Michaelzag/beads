@@ -164,15 +164,15 @@ func TestPersistDependenciesReturnsTargetLookupErrors(t *testing.T) {
 		}},
 	}
 
-	mock.ExpectQuery("SELECT 1 FROM wisps WHERE id = \\? LIMIT 1").
+	mock.ExpectQuery("SELECT id FROM wisps WHERE id = \\?").
 		WithArgs("target").
 		WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery("SELECT 1 FROM issues WHERE id = \\?").
+	mock.ExpectQuery("SELECT id FROM issues WHERE id = \\?").
 		WithArgs("target").
 		WillReturnError(targetErr)
 
 	err := PersistDependencies(ctx, tx, []*types.Issue{issue}, "tester")
-	if err == nil || !strings.Contains(err.Error(), "failed to check dependency target target for source") {
+	if !errors.Is(err, targetErr) || !strings.Contains(err.Error(), "failed to check dependency target target for source") {
 		t.Fatalf("error = %v, want dependency target lookup error", err)
 	}
 
@@ -199,12 +199,12 @@ func TestPersistDependenciesSkipsValidationErrorsWhenConfigured(t *testing.T) {
 	}
 	var skipped []string
 
-	mock.ExpectQuery("SELECT 1 FROM wisps WHERE id = \\? LIMIT 1").
+	mock.ExpectQuery("SELECT id FROM wisps WHERE id = \\?").
 		WithArgs("source").
 		WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery("SELECT 1 FROM issues WHERE id = \\?").
+	mock.ExpectQuery("SELECT id FROM issues WHERE id = \\?").
 		WithArgs("source").
-		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("source"))
 
 	result, err := PersistDependenciesWithOptionsResult(ctx, tx, []*types.Issue{issue}, "tester", storage.BatchCreateOptions{
 		SkipDependencyValidationErrors: true,
