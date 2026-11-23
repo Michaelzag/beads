@@ -212,9 +212,11 @@ func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 		}
 	}
 
+	var statusStr string
+	_, hasStatus := updates["status"]
+
 	// Auto-clear pinned column when status transitions away from "pinned".
 	if rawStatus, ok := updates["status"]; ok {
-		var statusStr string
 		switch v := rawStatus.(type) {
 		case string:
 			statusStr = v
@@ -234,6 +236,32 @@ func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 
 	// Auto-manage started_at (set on transition to in_progress). (GH#2796)
 	setClauses, args = ManageStartedAt(oldIssue, updates, setClauses, args)
+
+	oldActive := oldIssue.Status != types.StatusClosed && oldIssue.Status != types.StatusPinned
+	newActive := statusStr != string(types.StatusClosed) && statusStr != string(types.StatusPinned)
+	recomputeBlocked := hasStatus && oldActive != newActive
+	var affectedIssues, affectedWisps, guardIDs []string
+	if hasStatus && statusStr != string(oldIssue.Status) {
+		if isWisp {
+			affectedIssues, affectedWisps, err = AffectedByStatusChangeForWispInTx(ctx, tx, oldIssue.ID)
+		} else {
+			affectedIssues, affectedWisps, err = AffectedByStatusChangeInTx(ctx, tx, oldIssue.ID)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("affected by status change for %s: %w", oldIssue.ID, err)
+		}
+		guardIDs, err = statusCloseGuardIDsInTx(ctx, tx, oldIssue.ID, affectedIssues, affectedWisps)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		for _, field := range []string{"status", "assignee", "acceptance_criteria", "issue_type", "pinned", "await_id"} {
+			if _, ok := updates[field]; ok {
+				guardIDs = []string{oldIssue.ID}
+				break
+			}
+		}
+	}
 
 	args = append(args, id)
 
@@ -257,6 +285,10 @@ func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 		}
 	}
 
+	if err := BumpCloseGuardsInTx(ctx, tx, guardIDs...); err != nil {
+		return nil, err
+	}
+
 	if recordEvent {
 		oldData, _ := json.Marshal(oldIssue)
 		newData, _ := json.Marshal(updates)
@@ -267,30 +299,9 @@ func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 		}
 	}
 
-	if rawStatus, hasStatus := updates["status"]; hasStatus {
-		var newStatus string
-		switch v := rawStatus.(type) {
-		case string:
-			newStatus = v
-		case types.Status:
-			newStatus = string(v)
-		}
-		oldActive := oldIssue.Status != types.StatusClosed && oldIssue.Status != types.StatusPinned
-		newActive := newStatus != string(types.StatusClosed) && newStatus != string(types.StatusPinned)
-		if oldActive != newActive {
-			var affectedIssues, affectedWisps []string
-			var aerr error
-			if isWisp {
-				affectedIssues, affectedWisps, aerr = AffectedByStatusChangeForWispInTx(ctx, tx, id)
-			} else {
-				affectedIssues, affectedWisps, aerr = AffectedByStatusChangeInTx(ctx, tx, id)
-			}
-			if aerr != nil {
-				return nil, fmt.Errorf("affected by status change for %s: %w", id, aerr)
-			}
-			if err := RecomputeIsBlockedInTx(ctx, tx, affectedIssues, affectedWisps); err != nil {
-				return nil, fmt.Errorf("recompute is_blocked after status change for %s: %w", id, err)
-			}
+	if recomputeBlocked {
+		if err := RecomputeIsBlockedInTx(ctx, tx, affectedIssues, affectedWisps); err != nil {
+			return nil, fmt.Errorf("recompute is_blocked after status change for %s: %w", id, err)
 		}
 	}
 

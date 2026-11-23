@@ -20,6 +20,10 @@ import (
 
 const closeClaimReceiptPrefix = "_close_claim_v1:"
 
+// ErrCloseClaimGateUnsatisfied means the gate was evaluated and did not pass.
+// All other gate-check errors abort without recording a definitive receipt.
+var ErrCloseClaimGateUnsatisfied = errors.New("close-claim gate is unsatisfied")
+
 var (
 	closeClaimDigestPattern    = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	closeClaimOperationPattern = regexp.MustCompile(`^tracker-close:[0-9a-f]{64}$`)
@@ -112,15 +116,10 @@ func CloseClaimInTx(ctx context.Context, tx *sql.Tx, intent storage.CloseClaimIn
 			return CloseClaimResult{}, fmt.Errorf("issue resolved to an unversioned wisp during close")
 		}
 		receipt.Outcome = storage.CloseClaimClosed
+	} else if err := BumpCloseGuardsInTx(ctx, tx, intent.WorkItemID); err != nil {
+		return CloseClaimResult{}, err
 	}
 
-	// Different operations on one exact item must contend, even if at least
-	// one only writes a refusal. Different writes of the same operation must
-	// also conflict rather than merge as equal rows under Dolt MVCC.
-	issueKey := fmt.Sprintf("_close_claim_issue_v1:%x", sha256.Sum256([]byte(intent.WorkItemID)))
-	if err := SetMetadataInTx(ctx, tx, issueKey, intent.OperationID); err != nil {
-		return CloseClaimResult{}, fmt.Errorf("record close contention: %w", err)
-	}
 	writeID, err := uuid.NewRandom()
 	if err != nil {
 		return CloseClaimResult{}, fmt.Errorf("generate close receipt write ID: %w", err)
@@ -219,7 +218,10 @@ func checkCloseClaimInTx(ctx context.Context, tx *sql.Tx, intent storage.CloseCl
 			return "", fmt.Errorf("close-claim requires a gate policy checker")
 		}
 		if err := checkGate(issue); err != nil {
-			return storage.CloseClaimClosurePolicyRefused, nil
+			if errors.Is(err, ErrCloseClaimGateUnsatisfied) {
+				return storage.CloseClaimClosurePolicyRefused, nil
+			}
+			return "", fmt.Errorf("check close gate: %w", err)
 		}
 	}
 	blocked, blockers, err := IsBlockedInTx(ctx, tx, id)

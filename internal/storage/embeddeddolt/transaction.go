@@ -72,6 +72,7 @@ func (t *embeddedTransaction) CreateIssues(ctx context.Context, issues []*types.
 func (t *embeddedTransaction) UpdateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error {
 	t.dirty.MarkDirty("issues")
 	t.dirty.MarkDirty("events")
+	t.dirty.MarkDirty("metadata")
 	_, err := issueops.UpdateIssueInTx(ctx, t.tx, id, updates, actor)
 	return err
 }
@@ -79,6 +80,7 @@ func (t *embeddedTransaction) UpdateIssue(ctx context.Context, id string, update
 func (t *embeddedTransaction) CloseIssue(ctx context.Context, id string, reason string, actor string, session string) error {
 	t.dirty.MarkDirty("issues")
 	t.dirty.MarkDirty("events")
+	t.dirty.MarkDirty("metadata")
 	_, err := issueops.CloseIssueInTx(ctx, t.tx, id, reason, actor, session)
 	return err
 }
@@ -89,6 +91,7 @@ func (t *embeddedTransaction) DeleteIssue(ctx context.Context, id string) error 
 	t.dirty.MarkDirty("labels")
 	t.dirty.MarkDirty("comments")
 	t.dirty.MarkDirty("events")
+	t.dirty.MarkDirty("metadata")
 	return issueops.DeleteIssueInTx(ctx, t.tx, id)
 }
 
@@ -113,11 +116,15 @@ func (t *embeddedTransaction) AddDependencyWithOptions(ctx context.Context, dep 
 		return err
 	}
 	t.dirty.MarkDirty(depTable)
+	t.dirty.MarkDirty("issues")
+	t.dirty.MarkDirty("metadata")
 	return nil
 }
 
 func (t *embeddedTransaction) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
 	t.dirty.MarkDirty("dependencies")
+	t.dirty.MarkDirty("issues")
+	t.dirty.MarkDirty("metadata")
 	return issueops.RemoveDependencyInTx(ctx, t.tx, issueID, dependsOnID)
 }
 
@@ -131,11 +138,15 @@ func (t *embeddedTransaction) GetDependencyRecords(ctx context.Context, issueID 
 
 func (t *embeddedTransaction) AddLabel(ctx context.Context, issueID, label, actor string) error {
 	t.dirty.MarkDirty("labels")
+	t.dirty.MarkDirty("events")
+	t.dirty.MarkDirty("metadata")
 	return issueops.AddLabelInTx(ctx, t.tx, "", "", issueID, label, actor)
 }
 
 func (t *embeddedTransaction) RemoveLabel(ctx context.Context, issueID, label, actor string) error {
 	t.dirty.MarkDirty("labels")
+	t.dirty.MarkDirty("events")
+	t.dirty.MarkDirty("metadata")
 	return issueops.RemoveLabelInTx(ctx, t.tx, "", "", issueID, label, actor)
 }
 

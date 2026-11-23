@@ -39,8 +39,12 @@ func (s *EmbeddedDoltStore) ReleaseClaimWithResult(ctx context.Context, id, expe
 		}
 
 		tables := []string{"metadata"}
-		if result.Updated != nil && !result.Updated.IsWisp {
-			tables = append(tables, "issues", "events")
+		if result.Updated != nil {
+			// A wisp status change may also update a regular issue's blocker state.
+			tables = append(tables, "issues")
+			if !result.Updated.IsWisp {
+				tables = append(tables, "events")
+			}
 		}
 		for _, table := range tables {
 			if _, err := tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table); err != nil {

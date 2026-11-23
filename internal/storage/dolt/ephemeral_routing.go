@@ -11,7 +11,7 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-var permanentIssueAuxTables = []string{"issues", "labels", "dependencies", "events", "comments"}
+var permanentIssueAuxTables = []string{"issues", "labels", "dependencies", "events", "comments", "metadata"}
 
 // IsEphemeralID returns true if the ID belongs to an ephemeral issue.
 func IsEphemeralID(id string) bool {
@@ -203,6 +203,9 @@ func (s *DoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor s
 // Called by UpdateIssue when no_history=true or wisp=true is set on a regular issue.
 func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[string]interface{}, actor string) error {
 	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		if _, _, err := issueops.BumpRemovalCloseGuardsInTx(ctx, tx, []string{id}, nil); err != nil {
+			return fmt.Errorf("capture close guards before demoting %s: %w", id, err)
+		}
 		if _, err := issueops.UpdateIssueWithoutEventInTx(ctx, tx, id, updates, actor); err != nil {
 			return fmt.Errorf("update issue before demotion: %w", err)
 		}

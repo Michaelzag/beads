@@ -2,7 +2,6 @@ package issueops
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -81,12 +80,10 @@ func ReleaseClaimInTx(ctx context.Context, tx *sql.Tx, id, expectedAssignee, ope
 		return ReleaseClaimResult{}, err
 	}
 
-	// Dolt can merge identical issue-row writes from concurrent snapshots.
-	// Serialize both refusals and releases on the same canonical issue key.
-	// The exact ID was validated by updateIssueInTx before either outcome.
-	issueKey := fmt.Sprintf("_release_claim_issue_v1:%x", sha256.Sum256([]byte(id)))
-	if err := SetMetadataInTx(ctx, tx, issueKey, operationID); err != nil {
-		return ReleaseClaimResult{}, fmt.Errorf("record release contention: %w", err)
+	if result.releaseRefusal != "" {
+		if err := BumpCloseGuardsInTx(ctx, tx, id); err != nil {
+			return ReleaseClaimResult{}, err
+		}
 	}
 
 	// Never upsert. Distinct write IDs also prevent the Dolt merge from

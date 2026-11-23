@@ -22,6 +22,10 @@ func PromoteFromEphemeralInTx(ctx context.Context, tx *sql.Tx, id string, actor 
 		return fmt.Errorf("wisp %s not found", id)
 	}
 
+	if _, _, err := BumpRemovalCloseGuardsInTx(ctx, tx, nil, []string{id}); err != nil {
+		return fmt.Errorf("capture close guards before promoting %s: %w", id, err)
+	}
+
 	issue.Ephemeral = false
 
 	bc, err := NewBatchContext(ctx, tx, storage.BatchCreateOptions{
@@ -33,8 +37,12 @@ func PromoteFromEphemeralInTx(ctx context.Context, tx *sql.Tx, id string, actor 
 	if err := PrepareIssueForInsert(issue, bc.CustomStatuses, bc.CustomTypes); err != nil {
 		return fmt.Errorf("promote wisp to issues: %w", err)
 	}
-	if _, err := InsertIssueIfNew(ctx, tx, "issues", issue, false); err != nil {
+	if _, exactID, err := InsertIssueIfNew(ctx, tx, "issues", issue, false); err != nil {
 		return fmt.Errorf("promote wisp to issues: %w", err)
+	} else if exactID != id {
+		if _, _, err := BumpRemovalCloseGuardsInTx(ctx, tx, []string{exactID}, nil); err != nil {
+			return fmt.Errorf("capture close guards for promoted issue %s: %w", exactID, err)
+		}
 	}
 
 	if _, err := tx.ExecContext(ctx, `

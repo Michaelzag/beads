@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/storage"
@@ -43,7 +45,29 @@ var closeClaimCmd = &cobra.Command{
 		// The helper sees the in-transaction issue. Workflow discovery
 		// must not update await_id on a separate connection.
 		receipt, err := closer.CloseClaim(rootCtx, closeClaimIntentFromFlags(cmd, args[0]), actor, mode, func(issue *types.Issue) error {
-			return checkGateSatisfactionWithRunIDPersistence(issue, false)
+			if !isMachineCheckableGate(issue) {
+				return nil
+			}
+			var resolved bool
+			var reason string
+			var err error
+			switch {
+			case strings.HasPrefix(issue.AwaitType, "gh:run"):
+				resolved, _, reason, err = checkGHRunWithErrors(issue, false, true)
+			case strings.HasPrefix(issue.AwaitType, "gh:pr"):
+				resolved, _, reason, err = checkGHPRWithErrors(issue, true)
+			case issue.AwaitType == "timer":
+				resolved, _, reason, err = checkTimer(issue, time.Now())
+			case issue.AwaitType == "bead":
+				return fmt.Errorf("cross-rig bead gate %q cannot be checked", issue.AwaitID)
+			}
+			if err != nil {
+				return fmt.Errorf("could not evaluate gate condition: %w", err)
+			}
+			if !resolved {
+				return fmt.Errorf("%w: gate condition not satisfied: %s (use --force to override)", issueops.ErrCloseClaimGateUnsatisfied, reason)
+			}
+			return nil
 		})
 		if err != nil {
 			return fmt.Errorf("closing claim on %s: %w", args[0], err)

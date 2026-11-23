@@ -111,11 +111,25 @@ func CreateIssueInTxWithResult(ctx context.Context, tx *sql.Tx, bc *BatchContext
 		return result, nil
 	}
 
-	isNew, err := InsertIssueIfNew(ctx, tx, issueTable, issue, bc.Opts.ConflictSkip)
+	isNew, exactID, err := InsertIssueIfNew(ctx, tx, issueTable, issue, bc.Opts.ConflictSkip)
 	if err != nil {
 		return result, err
 	}
 	result.markChanged(issueTable)
+	if isNew || !bc.Opts.ConflictSkip {
+		findAffected := AffectedByStatusChangeInTx
+		if IsWisp(issue) {
+			findAffected = AffectedByStatusChangeForWispInTx
+		}
+		affectedIssues, affectedWisps, err := findAffected(ctx, tx, exactID)
+		if err != nil {
+			return result, fmt.Errorf("affected by create for %s: %w", issue.ID, err)
+		}
+		if err := BumpStatusCloseGuardsInTx(ctx, tx, exactID, affectedIssues, affectedWisps); err != nil {
+			return result, err
+		}
+		result.markChanged("metadata")
+	}
 
 	if isNew {
 		if err := RecordEventInTable(ctx, tx, eventTable, issue.ID, types.EventCreated, actor, ""); err != nil {
@@ -129,6 +143,13 @@ func CreateIssueInTxWithResult(ctx context.Context, tx *sql.Tx, bc *BatchContext
 		return result, err
 	}
 	result.ChangedTables = mergeChangedTables(result.ChangedTables, labelResult.ChangedTables)
+	// ConflictSkip still permits label inserts on existing issues.
+	if !result.ChangedTables["metadata"] && len(labelResult.ChangedTables) > 0 {
+		if err := BumpCloseGuardsInTx(ctx, tx, exactID); err != nil {
+			return result, err
+		}
+		result.markChanged("metadata")
+	}
 	commentResult, err := PersistComments(ctx, tx, issue)
 	if err != nil {
 		return result, err
@@ -493,7 +514,7 @@ func CheckOrphan(ctx context.Context, tx *sql.Tx, issue *types.Issue, issueTable
 	}
 }
 
-// InsertIssueIfNew inserts the issue and returns whether it was genuinely new.
+// InsertIssueIfNew returns whether the issue was new and its exact stored ID.
 //
 // When conflictSkip is true and an issue with the same ID already exists, the
 // row is left untouched (no UPSERT) and isNew is false. This is the
@@ -504,20 +525,23 @@ func CheckOrphan(ctx context.Context, tx *sql.Tx, issue *types.Issue, issueTable
 // KEY UPDATE, so explicit `bd import` keeps UPSERT semantics.
 //
 //nolint:gosec // G201: table is a hardcoded constant
-func InsertIssueIfNew(ctx context.Context, tx *sql.Tx, issueTable string, issue *types.Issue, conflictSkip bool) (isNew bool, err error) {
-	var existingCount int
+func InsertIssueIfNew(ctx context.Context, tx *sql.Tx, issueTable string, issue *types.Issue, conflictSkip bool) (isNew bool, exactID string, err error) {
 	if issue.ID != "" {
-		if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE id = ?`, issueTable), issue.ID).Scan(&existingCount); err != nil {
-			return false, fmt.Errorf("failed to check issue existence for %s: %w", issue.ID, err)
+		err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT id FROM %s WHERE id = ?`, issueTable), issue.ID).Scan(&exactID)
+		if err != nil && err != sql.ErrNoRows {
+			return false, "", fmt.Errorf("failed to check issue existence for %s: %w", issue.ID, err)
 		}
 	}
-	if conflictSkip && existingCount > 0 {
-		return false, nil // issue already exists — skip, never overwrite
+	if conflictSkip && exactID != "" {
+		return false, exactID, nil // issue already exists — skip, never overwrite
 	}
 	if err := InsertIssueIntoTable(ctx, tx, issueTable, issue); err != nil {
-		return false, fmt.Errorf("failed to insert issue %s: %w", issue.ID, err)
+		return false, "", fmt.Errorf("failed to insert issue %s: %w", issue.ID, err)
 	}
-	return existingCount == 0, nil
+	if exactID != "" {
+		return false, exactID, nil
+	}
+	return true, issue.ID, nil
 }
 
 func PersistLabels(ctx context.Context, tx *sql.Tx, issue *types.Issue, actor, eventTable string) (CreateIssueResult, error) {
@@ -637,17 +661,18 @@ func PersistDependenciesWithOptionsResult(ctx context.Context, tx *sql.Tx, issue
 			}
 
 			kind := ClassifyDepTarget(ctx, tx, dep, false)
+			targetID := dep.DependsOnID
 
 			if kind != DepTargetExternal {
 				lookupTable := "issues"
 				if kind == DepTargetWisp {
 					lookupTable = "wisps"
 				}
-				var exists int
+				// Read the stored spelling: the target lookup can use a case-insensitive collation.
 				//nolint:gosec // G201: lookupTable is one of two hardcoded constants
 				if err := tx.QueryRowContext(ctx,
-					fmt.Sprintf("SELECT 1 FROM %s WHERE id = ?", lookupTable),
-					dep.DependsOnID).Scan(&exists); err != nil {
+					fmt.Sprintf("SELECT id FROM %s WHERE id = ?", lookupTable),
+					dep.DependsOnID).Scan(&targetID); err != nil {
 					if err == sql.ErrNoRows {
 						recordSkippedDependency(opts, dep, "target not found")
 						continue
@@ -662,6 +687,22 @@ func PersistDependenciesWithOptionsResult(ctx context.Context, tx *sql.Tx, issue
 					continue
 				}
 				return result, fmt.Errorf("invalid dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)
+			}
+
+			findAffected := AffectedByDepChangeInTx
+			sourceTable := "issues"
+			if depTable == "wisp_dependencies" {
+				findAffected = AffectedByDepChangeForWispInTx
+				sourceTable = "wisps"
+			}
+			var sourceID string
+			//nolint:gosec // G201: sourceTable is one of two hardcoded constants
+			if err := tx.QueryRowContext(ctx, fmt.Sprintf("SELECT id FROM %s WHERE id = ?", sourceTable), dep.IssueID).Scan(&sourceID); err != nil {
+				return result, fmt.Errorf("resolve dependency source %s: %w", dep.IssueID, err)
+			}
+			beforeIssues, beforeWisps, err := findAffected(ctx, tx, sourceID, targetID, dep.Type)
+			if err != nil {
+				return result, fmt.Errorf("affected before persisting dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)
 			}
 
 			createdAt := dep.CreatedAt
@@ -683,6 +724,18 @@ func PersistDependenciesWithOptionsResult(ctx context.Context, tx *sql.Tx, issue
 			}
 			if rowsAffected > 0 {
 				result.markChanged(depTable)
+				afterIssues, afterWisps, err := findAffected(ctx, tx, sourceID, targetID, dep.Type)
+				if err != nil {
+					return result, fmt.Errorf("affected after persisting dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)
+				}
+				// A typed foreign key can store the input spelling rather than the parent row's spelling.
+				if sourceID != dep.IssueID || targetID != dep.DependsOnID {
+					afterIssues = append(afterIssues, dep.IssueID, dep.DependsOnID)
+				}
+				if err := BumpDependencyCloseGuardsInTx(ctx, tx, sourceID, targetID, beforeIssues, beforeWisps, afterIssues, afterWisps); err != nil {
+					return result, err
+				}
+				result.markChanged("metadata")
 			}
 		}
 	}

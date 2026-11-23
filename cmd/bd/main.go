@@ -826,7 +826,9 @@ var rootCmd = &cobra.Command{
 
 		// Ambient staleness warning: if Linear data is stale, warn once per
 		// shell session on stderr. Only fires when LINEAR_API_KEY is set.
-		maybeWarnLinearStaleness(cmd)
+		if cmd.Name() != "close-claim" {
+			maybeWarnLinearStaleness(cmd)
+		}
 
 		if skipsStoreInit {
 			return
@@ -1116,13 +1118,13 @@ var rootCmd = &cobra.Command{
 		// Skip for read-only commands since they can't corrupt data.
 		// Skip for --global: the global database uses a sentinel project ID
 		// that won't match any project's metadata.json.
-		if !useReadOnly && !globalFlag && os.Getenv("BEADS_SKIP_IDENTITY_CHECK") != "1" {
+		if !isCloseClaim && !useReadOnly && !globalFlag && os.Getenv("BEADS_SKIP_IDENTITY_CHECK") != "1" {
 			validateWorkspaceIdentity(rootCtx, beadsDir)
 		}
 
 		// Initialize hook runner
 		// dbPath is .beads/something.db, so workspace root is parent of .beads
-		if dbPath != "" {
+		if !isCloseClaim && dbPath != "" {
 			beadsDir := filepath.Dir(dbPath)
 			hookRunner = hooks.NewRunner(filepath.Join(beadsDir, "hooks"))
 		}
@@ -1132,12 +1134,14 @@ var rootCmd = &cobra.Command{
 		// Set BD_NO_HOOKS=1 to disable all hook firing (useful for
 		// bulk imports, migrations, or environments where hooks
 		// should not run).
-		if hookRunner != nil && store != nil && !config.GetBool("no-hooks") {
+		if !isCloseClaim && hookRunner != nil && store != nil && !config.GetBool("no-hooks") {
 			store = storage.NewHookFiringStore(store, hookRunner)
 		}
 
 		// Warn if multiple databases detected in directory hierarchy
-		warnMultipleDatabases(dbPath)
+		if !isCloseClaim {
+			warnMultipleDatabases(dbPath)
+		}
 
 		// Load molecule templates from hierarchical catalog locations
 		// Templates are loaded after auto-import to ensure the database is up-to-date.

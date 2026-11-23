@@ -622,6 +622,9 @@ func (t *doltTransaction) UpdateIssue(ctx context.Context, id string, updates ma
 		return wrapExecError("update issue in tx", err)
 	}
 	t.dirty.MarkDirty(table)
+	if table == "issues" {
+		t.dirty.MarkDirty("metadata")
+	}
 	return nil
 }
 
@@ -635,6 +638,9 @@ func (t *doltTransaction) CloseIssue(ctx context.Context, id string, reason stri
 		return wrapExecError("close issue in tx", err)
 	}
 	t.dirty.MarkDirty(table)
+	if table == "issues" {
+		t.dirty.MarkDirty("metadata")
+	}
 	return nil
 }
 
@@ -646,7 +652,11 @@ func (t *doltTransaction) DeleteIssue(ctx context.Context, id string) error {
 	if err := issueops.DeleteIssueInTx(ctx, t.txFor(table), id); err != nil {
 		return wrapExecError("delete issue in tx", err)
 	}
-	t.dirty.MarkDirty(table)
+	if table == "issues" {
+		for _, table := range issueDeleteCommitTables {
+			t.dirty.MarkDirty(table)
+		}
+	}
 	return nil
 }
 
@@ -689,6 +699,10 @@ func (t *doltTransaction) AddDependencyWithOptions(ctx context.Context, dep *typ
 		return err
 	}
 	t.dirty.MarkDirty(table)
+	if table == "dependencies" {
+		t.dirty.MarkDirty("issues")
+		t.dirty.MarkDirty("metadata")
+	}
 	return nil
 }
 
@@ -737,6 +751,10 @@ func (t *doltTransaction) RemoveDependency(ctx context.Context, issueID, depends
 		return wrapExecError("remove dependency in tx", err)
 	}
 	t.dirty.MarkDirty(table)
+	if table == "dependencies" {
+		t.dirty.MarkDirty("issues")
+		t.dirty.MarkDirty("metadata")
+	}
 	return nil
 }
 
@@ -747,14 +765,14 @@ func (t *doltTransaction) AddLabel(ctx context.Context, issueID, label, actor st
 		table = "wisp_labels"
 	}
 
-	//nolint:gosec // G201: table is hardcoded
-	_, err := t.txFor(table).ExecContext(ctx, fmt.Sprintf(`
-		INSERT IGNORE INTO %s (issue_id, label) VALUES (?, ?)
-	`, table), issueID, label)
-	if err == nil {
-		t.dirty.MarkDirty(table)
+	if err := issueops.AddLabelWithoutEventInTx(ctx, t.txFor(table), table, issueID, label); err != nil {
+		return wrapExecError("add label in tx", err)
 	}
-	return wrapExecError("add label in tx", err)
+	t.dirty.MarkDirty(table)
+	if table == "labels" && strings.HasPrefix(label, "repo:") {
+		t.dirty.MarkDirty("metadata")
+	}
+	return nil
 }
 
 func (t *doltTransaction) GetLabels(ctx context.Context, issueID string) ([]string, error) {
@@ -787,14 +805,15 @@ func (t *doltTransaction) RemoveLabel(ctx context.Context, issueID, label, actor
 		table = "wisp_labels"
 	}
 
-	//nolint:gosec // G201: table is hardcoded
-	_, err := t.txFor(table).ExecContext(ctx, fmt.Sprintf(`
-		DELETE FROM %s WHERE issue_id = ? AND label = ?
-	`, table), issueID, label)
-	if err == nil {
-		t.dirty.MarkDirty(table)
+	if err := issueops.RemoveLabelWithoutEventInTx(ctx, t.txFor(table), table, issueID, label); err != nil {
+		return wrapExecError("remove label in tx", err)
 	}
-	return wrapExecError("remove label in tx", err)
+	t.dirty.MarkDirty(table)
+	if table == "labels" {
+		// SQL may have matched a differently cased stored repo label.
+		t.dirty.MarkDirty("metadata")
+	}
+	return nil
 }
 
 // SetConfig sets a config value within the transaction

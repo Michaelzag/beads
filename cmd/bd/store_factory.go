@@ -53,6 +53,8 @@ func newDoltStore(ctx context.Context, cfg *dolt.Config) (storage.DoltStorage, e
 }
 
 func newCloseClaimStore(ctx context.Context, cfg *dolt.Config) (storage.DoltStorage, error) {
+	cfg.AutoStart = false
+	cfg.CreateIfMissing = false
 	if cfg.ServerMode {
 		return dolt.New(ctx, cfg)
 	}
