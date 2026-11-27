@@ -96,6 +96,25 @@ func (s *EmbeddedDoltStore) UpdateIssue(ctx context.Context, id string, updates 
 	})
 }
 
+// UpdateIssueConditional applies updates only if cond holds in the writing
+// transaction, replacing the issue's guard token in the same transaction.
+func (s *EmbeddedDoltStore) UpdateIssueConditional(ctx context.Context, id string, updates map[string]interface{}, actor string, cond storage.UpdatePrecondition) error {
+	if rawMeta, ok := updates["metadata"]; ok {
+		metadataStr, err := storage.NormalizeMetadataValue(rawMeta)
+		if err != nil {
+			return fmt.Errorf("invalid metadata: %w", err)
+		}
+		if err := issueops.ValidateMetadataIfConfigured(json.RawMessage(metadataStr)); err != nil {
+			return err
+		}
+	}
+
+	return s.withConn(ctx, true, func(tx *sql.Tx) error {
+		_, err := issueops.UpdateIssueConditionalInTx(ctx, tx, id, updates, actor, cond)
+		return err
+	})
+}
+
 // ReopenIssue reopens a closed issue, setting status to open and clearing
 // closed_at and defer_until. If reason is non-empty, it is recorded as a comment.
 // Wraps UpdateIssue; EmbeddedDolt auto-commits the transaction.

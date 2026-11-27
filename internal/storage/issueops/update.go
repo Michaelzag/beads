@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -127,17 +128,27 @@ type UpdateResult struct {
 //
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
 func UpdateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string) (*UpdateResult, error) {
-	return updateIssueInTx(ctx, tx, id, updates, actor, true, "")
+	return updateIssueInTx(ctx, tx, id, updates, actor, true, "", nil)
 }
 
 // UpdateIssueWithoutEventInTx applies normal update semantics without recording
 // an intermediate event. Demotion uses this to preserve the historical event
 // stream: create/update history is copied, then a single demotion event is added.
 func UpdateIssueWithoutEventInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string) (*UpdateResult, error) {
-	return updateIssueInTx(ctx, tx, id, updates, actor, false, "")
+	return updateIssueInTx(ctx, tx, id, updates, actor, false, "", nil)
 }
 
-func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string, recordEvent bool, releaseAssignee string) (*UpdateResult, error) {
+// UpdateIssueConditionalInTx applies the update only when cond still holds for
+// the exact issue ID in this transaction, and then always replaces its guard.
+// A failed precondition returns *storage.UpdatePreconditionFailed before any write.
+func UpdateIssueConditionalInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string, cond storage.UpdatePrecondition) (*UpdateResult, error) {
+	if cond.Status == nil && cond.Guard == nil {
+		return nil, fmt.Errorf("conditional update requires a precondition")
+	}
+	return updateIssueInTx(ctx, tx, id, updates, actor, true, "", &cond)
+}
+
+func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string, recordEvent bool, releaseAssignee string, cond *storage.UpdatePrecondition) (*UpdateResult, error) {
 	// Route to correct table.
 	isWisp := IsActiveWispInTx(ctx, tx, id)
 	issueTable, labelTable, eventTable, _ := WispTableRouting(isWisp)
@@ -145,7 +156,8 @@ func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 	// Read old issue inside the transaction for consistency.
 	var oldIssue *types.Issue
 	var err error
-	if releaseAssignee != "" {
+	exact := releaseAssignee != "" || cond != nil
+	if exact {
 		// Read the same table the conditional write will target.
 		oldIssue, err = getIssueFromTableInTx(ctx, tx, issueTable, labelTable, id)
 	} else {
@@ -154,10 +166,15 @@ func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issue for update: %w", err)
 	}
-	if releaseAssignee != "" {
-		if oldIssue.ID != id {
-			return nil, fmt.Errorf("%w: no issue with exact ID %q", storage.ErrNotFound, id)
+	if exact && oldIssue.ID != id {
+		return nil, fmt.Errorf("%w: no issue with exact ID %q", storage.ErrNotFound, id)
+	}
+	if cond != nil {
+		if err := checkUpdatePreconditionInTx(ctx, tx, oldIssue, *cond); err != nil {
+			return nil, err
 		}
+	}
+	if releaseAssignee != "" {
 		if oldIssue.Status != types.StatusInProgress {
 			return &UpdateResult{releaseRefusal: storage.ReleaseClaimNotInProgress}, nil
 		}
@@ -262,6 +279,11 @@ func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 			}
 		}
 	}
+	if cond != nil && len(guardIDs) == 0 {
+		// A conditional writer must invalidate the token it consumed, so a
+		// concurrent writer from the same prior state conflicts or refuses.
+		guardIDs = []string{oldIssue.ID}
+	}
 
 	args = append(args, id)
 
@@ -306,6 +328,36 @@ func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 	}
 
 	return &UpdateResult{OldIssue: oldIssue, IsWisp: isWisp}, nil
+}
+
+// checkUpdatePreconditionInTx compares the caller's expected state with the
+// issue row and guard cell read by this transaction.
+func checkUpdatePreconditionInTx(ctx context.Context, tx *sql.Tx, issue *types.Issue, cond storage.UpdatePrecondition) error {
+	if cond.Status != nil && string(issue.Status) != *cond.Status {
+		return &storage.UpdatePreconditionFailed{Field: "status", Expected: *cond.Status, Actual: string(issue.Status)}
+	}
+	if cond.Guard == nil {
+		return nil
+	}
+	guard, err := CloseGuardTokenInTx(ctx, tx, issue.ID)
+	if err != nil {
+		return err
+	}
+	if guard != *cond.Guard {
+		return &storage.UpdatePreconditionFailed{Field: "guard", Expected: *cond.Guard, Actual: guard}
+	}
+	return nil
+}
+
+// CloseGuardTokenInTx returns the exact issue ID's guard token, or "" when no
+// guarded writer has set it.
+func CloseGuardTokenInTx(ctx context.Context, tx *sql.Tx, id string) (string, error) {
+	var guard string
+	err := tx.QueryRowContext(ctx, "SELECT value FROM metadata WHERE `key` = ?", storage.CloseGuardKey(id)).Scan(&guard)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("read guard for %s: %w", id, err)
+	}
+	return guard, nil
 }
 
 // RecordFullEventInTable records an event with both old and new values.

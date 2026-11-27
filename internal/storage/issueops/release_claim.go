@@ -75,7 +75,7 @@ func ReleaseClaimInTx(ctx context.Context, tx *sql.Tx, id, expectedAssignee, ope
 	result, err := updateIssueInTx(ctx, tx, id, map[string]interface{}{
 		"status":   types.StatusOpen,
 		"assignee": "",
-	}, actor, true, expectedAssignee)
+	}, actor, true, expectedAssignee, nil)
 	if err != nil {
 		return ReleaseClaimResult{}, err
 	}
