@@ -22,10 +22,10 @@ import (
 const historyWindowSize = 256
 
 type historyCommit struct {
-	hash, committer  string
-	date, authorDate time.Time
-	height           uint64
-	parents          []string
+	hash, committer string
+	date            time.Time
+	height          uint64
+	parents         []string
 }
 
 type historyEdge struct {
@@ -127,7 +127,7 @@ func historyPage(ctx context.Context, tx *sql.Tx, frontier map[string]struct{}) 
 			args = append(args, root)
 		}
 		rows, err := tx.QueryContext(ctx, `
-			SELECT commit_hash, committer, date, author_date, commit_order, parents
+			SELECT commit_hash, committer, date, commit_order, parents
 			FROM DOLT_LOG(`+strings.Repeat("?, ", len(batch))+`'--parents', '--decorate=no')
 			LIMIT ?`, append(args, historyWindowSize)...)
 		if err != nil {
@@ -136,7 +136,7 @@ func historyPage(ctx context.Context, tx *sql.Tx, frontier map[string]struct{}) 
 		for rows.Next() {
 			var commit historyCommit
 			var parents string
-			if err := rows.Scan(&commit.hash, &commit.committer, &commit.date, &commit.authorDate, &commit.height, &parents); err != nil {
+			if err := rows.Scan(&commit.hash, &commit.committer, &commit.date, &commit.height, &parents); err != nil {
 				rows.Close()
 				return nil, err
 			}
@@ -159,7 +159,7 @@ func historyPage(ctx context.Context, tx *sql.Tx, frontier map[string]struct{}) 
 				case a.height < b.height:
 					return 1
 				default:
-					return b.authorDate.Compare(a.authorDate)
+					return b.date.Compare(a.date)
 				}
 			})
 			seen := make(map[string]bool)

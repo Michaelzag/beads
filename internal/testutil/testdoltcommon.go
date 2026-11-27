@@ -1,6 +1,7 @@
 package testutil
 
 import (
+	"cmp"
 	"fmt"
 	"net"
 	"os"
@@ -9,8 +10,9 @@ import (
 	"time"
 )
 
-// DoltDockerImage is the Docker image used for Dolt test containers.
-const DoltDockerImage = "dolthub/dolt-sql-server:1.88.1"
+// DoltDockerImage defaults to the production version. Set BEADS_TEST_DOLT_IMAGE
+// before starting the test process to run against a different image.
+var DoltDockerImage = cmp.Or(os.Getenv("BEADS_TEST_DOLT_IMAGE"), "dolthub/dolt-sql-server:1.86.5")
 
 // RequireDoltBinary ensures the `dolt` CLI binary is available. The test is
 // skipped locally when dolt is missing but fatally fails under GitHub Actions
