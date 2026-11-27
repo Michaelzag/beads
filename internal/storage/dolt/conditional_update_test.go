@@ -310,3 +310,112 @@ func TestUpdateIssueConditionalConcurrent(t *testing.T) {
 		t.Fatalf("conditional update events = %d; want 1", n)
 	}
 }
+
+func guardedParent(g *storage.GuardedIssue) string {
+	for _, dep := range g.Dependencies {
+		if dep.DependencyType == types.DepParentChild {
+			return dep.ID
+		}
+	}
+	return ""
+}
+
+// A reparent that lands while show's read is in flight cannot pair the new
+// parent with a token, nor an old token with a parent it does not stand for.
+func TestGetGuardedIssueSnapshotAcrossReparent(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+	// The open read transaction pins one connection; writers need their own.
+	store.db.SetMaxOpenConns(4)
+
+	const child, parentA, parentB, actor = "test-child", "test-parent-a", "test-parent-b", "snapshot-test"
+	for _, id := range []string{child, parentA, parentB} {
+		if err := store.CreateIssue(ctx, &types.Issue{ID: id, Title: id, Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}, actor); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	if err := store.AddDependency(ctx, &types.Dependency{IssueID: child, DependsOnID: parentA, Type: types.DepParentChild}, actor); err != nil {
+		t.Fatalf("add parent: %v", err)
+	}
+
+	// Start the read, then reparent from another connection before the issue
+	// and edges are read.
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin read: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	firstToken, err := issueops.CloseGuardTokenInTx(ctx, tx, child)
+	if err != nil || firstToken == "" {
+		t.Fatalf("first guard read = %q, %v", firstToken, err)
+	}
+	if err := store.RemoveDependency(ctx, child, parentA, actor); err != nil {
+		t.Fatalf("remove parent: %v", err)
+	}
+	if err := store.AddDependency(ctx, &types.Dependency{IssueID: child, DependsOnID: parentB, Type: types.DepParentChild}, actor); err != nil {
+		t.Fatalf("add new parent: %v", err)
+	}
+	snap, err := issueops.GetGuardedIssueInTx(ctx, tx, child)
+	if err != nil {
+		t.Fatalf("guarded read: %v", err)
+	}
+	_ = tx.Rollback()
+	if snap.GuardToken != firstToken || guardedParent(snap) != parentA {
+		t.Fatalf("snapshot = token %q parent %q; want the pre-reparent pair %q/%q", snap.GuardToken, guardedParent(snap), firstToken, parentA)
+	}
+	// The pre-reparent pair no longer holds, so a CAS on it refuses.
+	before := readTrackerState(ctx, t, store, child)
+	err = store.UpdateIssueConditional(ctx, child, map[string]interface{}{"status": "in_progress"}, actor,
+		storage.UpdatePrecondition{Status: strPtr(string(snap.Issue.Status)), Guard: strPtr(snap.GuardToken)})
+	requirePreconditionFailed(t, err, "guard", snap.GuardToken, before.guard)
+	if after := readTrackerState(ctx, t, store, child); !reflect.DeepEqual(before, after) {
+		t.Fatalf("refused CAS wrote: before = %+v, after = %+v", before, after)
+	}
+
+	// A fresh read pairs the new parent with the current token, and a CAS on it lands.
+	fresh, err := store.GetGuardedIssue(ctx, child)
+	if err != nil {
+		t.Fatalf("fresh guarded read: %v", err)
+	}
+	if guardedParent(fresh) != parentB || fresh.GuardToken != before.guard {
+		t.Fatalf("fresh snapshot = token %q parent %q; want %q/%q", fresh.GuardToken, guardedParent(fresh), before.guard, parentB)
+	}
+	if err := store.UpdateIssueConditional(ctx, child, map[string]interface{}{"status": "in_progress"}, actor,
+		storage.UpdatePrecondition{Status: strPtr(string(fresh.Issue.Status)), Guard: strPtr(fresh.GuardToken)}); err != nil {
+		t.Fatalf("CAS on a consistent snapshot: %v", err)
+	}
+}
+
+// The guarded read returns the row a conditional update writes, even when a
+// regular issue and a wisp share an ID.
+func TestGetGuardedIssueRoutesLikeConditionalUpdate(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	const id, actor = "test-routed", "routing-test"
+	if err := store.CreateIssue(ctx, &types.Issue{ID: id, Title: "regular", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}, actor); err != nil {
+		t.Fatalf("create regular: %v", err)
+	}
+	if err := store.CreateIssue(ctx, &types.Issue{ID: id, Title: "wisp", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask, Ephemeral: true}, actor); err != nil {
+		t.Skipf("duplicate wisp ID not creatable here: %v", err)
+	}
+	snap, err := store.GetGuardedIssue(ctx, id)
+	if err != nil {
+		t.Fatalf("guarded read: %v", err)
+	}
+	if err := store.UpdateIssueConditional(ctx, id, map[string]interface{}{"notes": "cas"}, actor,
+		storage.UpdatePrecondition{Guard: strPtr(snap.GuardToken)}); err != nil {
+		t.Fatalf("conditional update: %v", err)
+	}
+	after, err := store.GetGuardedIssue(ctx, id)
+	if err != nil {
+		t.Fatalf("guarded read: %v", err)
+	}
+	if after.Issue.Title != snap.Issue.Title || after.Issue.Notes != "cas" {
+		t.Fatalf("guarded read %q/%q after CAS on the row read as %q; want the written row", after.Issue.Title, after.Issue.Notes, snap.Issue.Title)
+	}
+}

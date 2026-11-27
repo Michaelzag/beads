@@ -298,6 +298,11 @@ create, update, show, or close operation).`,
 			fmt.Println("No updates specified")
 			return
 		}
+		if cond != nil && clearDeferStatus {
+			// The implicit undefer status would come from a read outside the
+			// conditional transaction.
+			FatalErrorRespectJSON("--defer \"\" with --if-status/--if-guard requires an explicit --status")
+		}
 
 		ctx := rootCtx
 

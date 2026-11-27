@@ -145,7 +145,35 @@ func UpdateIssueConditionalInTx(ctx context.Context, tx *sql.Tx, id string, upda
 	if cond.Status == nil && cond.Guard == nil {
 		return nil, fmt.Errorf("conditional update requires a precondition")
 	}
+	for _, key := range []string{"wisp", "no_history"} {
+		if _, ok := updates[key]; ok {
+			return nil, fmt.Errorf("conditional update cannot change wisp or history routing")
+		}
+	}
 	return updateIssueInTx(ctx, tx, id, updates, actor, true, "", &cond)
+}
+
+// GetGuardedIssueInTx reads the exact issue ID from the table a conditional
+// update routes to, its outgoing dependencies and its guard token, all from
+// this transaction's snapshot.
+func GetGuardedIssueInTx(ctx context.Context, tx *sql.Tx, id string) (*storage.GuardedIssue, error) {
+	issueTable, labelTable, _, _ := WispTableRouting(IsActiveWispInTx(ctx, tx, id))
+	issue, err := getIssueFromTableInTx(ctx, tx, issueTable, labelTable, id)
+	if err != nil {
+		return nil, err
+	}
+	if issue.ID != id {
+		return nil, fmt.Errorf("%w: no issue with exact ID %q", storage.ErrNotFound, id)
+	}
+	guard, err := CloseGuardTokenInTx(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	deps, err := GetDependenciesWithMetadataInTx(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &storage.GuardedIssue{Issue: issue, Dependencies: deps, GuardToken: guard}, nil
 }
 
 func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string, recordEvent bool, releaseAssignee string, cond *storage.UpdatePrecondition) (*UpdateResult, error) {

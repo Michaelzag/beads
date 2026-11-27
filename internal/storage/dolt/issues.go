@@ -209,12 +209,6 @@ func (s *DoltStore) UpdateIssueConditional(ctx context.Context, id string, updat
 			return err
 		}
 	}
-	_, settingNoHistory := updates["no_history"]
-	_, settingWisp := updates["wisp"]
-	if settingNoHistory || settingWisp {
-		return fmt.Errorf("conditional update cannot change wisp or history routing")
-	}
-
 	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
 		result, err := issueops.UpdateIssueConditionalInTx(ctx, tx, id, updates, actor, cond)
 		if err != nil {
@@ -228,6 +222,18 @@ func (s *DoltStore) UpdateIssueConditional(ctx context.Context, id string, updat
 		}
 		return s.doltAddAndCommitInTx(ctx, tx, tables, fmt.Sprintf("bd: update %s", id))
 	})
+}
+
+// GetGuardedIssue reads an issue, its dependencies and its guard token in one
+// read transaction, routed as UpdateIssueConditional routes.
+func (s *DoltStore) GetGuardedIssue(ctx context.Context, id string) (*storage.GuardedIssue, error) {
+	var result *storage.GuardedIssue
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetGuardedIssueInTx(ctx, tx, id)
+		return err
+	})
+	return result, err
 }
 
 // ClaimIssue atomically claims an issue using compare-and-swap semantics.

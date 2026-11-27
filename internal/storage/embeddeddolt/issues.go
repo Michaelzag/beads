@@ -115,6 +115,18 @@ func (s *EmbeddedDoltStore) UpdateIssueConditional(ctx context.Context, id strin
 	})
 }
 
+// GetGuardedIssue reads an issue, its dependencies and its guard token in one
+// read transaction, routed as UpdateIssueConditional routes.
+func (s *EmbeddedDoltStore) GetGuardedIssue(ctx context.Context, id string) (*storage.GuardedIssue, error) {
+	var result *storage.GuardedIssue
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetGuardedIssueInTx(ctx, tx, id)
+		return err
+	})
+	return result, err
+}
+
 // ReopenIssue reopens a closed issue, setting status to open and clearing
 // closed_at and defer_until. If reason is non-empty, it is recorded as a comment.
 // Wraps UpdateIssue; EmbeddedDolt auto-commits the transaction.

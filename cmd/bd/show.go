@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -144,19 +145,23 @@ var showCmd = &cobra.Command{
 			}
 
 			if jsonOutput {
-				// The guard token is read before the issue and its edges, so a
-				// conditional update with it fails if they changed after it.
-				snap, err := readShowSnapshot(ctx, issueStore, issue.ID)
+				// Status, parent edge and guard_token come from one snapshot, so
+				// update --if-guard refuses if any of them changed since.
+				snap, err := readGuardedIssue(ctx, issueStore, issue.ID)
 				if err != nil {
 					result.Close()
 					FatalErrorRespectJSON("reading %s: %v", id, err)
 				}
-				issue = snap.issue
+				issue = snap.Issue
+				var guardToken *string
+				if snap.GuardToken != "" {
+					guardToken = &snap.GuardToken
+				}
 				// be-ijck6q: default is count-only (no dependents/comments slice in output).
 				// Use --include-dependents / --include-comments to stream the full lists.
 				details := &types.IssueDetails{Issue: *issue}
 				details.Labels, _ = issueStore.GetLabels(ctx, issue.ID)
-				details.Dependencies = snap.dependencies
+				details.Dependencies = snap.Dependencies
 
 				// Aggregate counts — O(1) queries, no row materialization.
 				depCount, _ := issueStore.CountDependents(ctx, issue.ID)
@@ -228,7 +233,7 @@ var showCmd = &cobra.Command{
 						break
 					}
 				}
-				allDetails = append(allDetails, &showIssueJSON{IssueDetails: details, GuardToken: snap.guardToken})
+				allDetails = append(allDetails, &showIssueJSON{IssueDetails: details, GuardToken: guardToken})
 				result.Close()
 				continue
 			}
@@ -448,41 +453,15 @@ type showIssueJSON struct {
 	GuardToken *string `json:"guard_token"`
 }
 
-// showAfterGuardRead lets tests run a writer between the guard read and the
-// reads it covers.
-var showAfterGuardRead = func() {}
-
-type showSnapshot struct {
-	issue        *types.Issue
-	dependencies []*types.IssueWithDependencyMetadata
-	guardToken   *string
-}
-
-// readShowSnapshot reads the guard token BEFORE the issue row and its
-// dependency edges. Status, assignee and dependency/parent writes replace the
-// token, so any such write after the token read makes update --if-guard with
-// the returned token refuse; a successful conditional update therefore acted
-// on a status and parent no older than the token.
-func readShowSnapshot(ctx context.Context, s storage.DoltStorage, id string) (*showSnapshot, error) {
-	token, err := s.GetMetadata(ctx, storage.CloseGuardKey(id))
-	if err != nil {
-		return nil, fmt.Errorf("guard token: %w", err)
+// readGuardedIssue reads the issue (routed as update --if-guard routes), its
+// dependency edges and its guard token from one transaction snapshot, so the
+// returned status and parent are exactly the state the token stands for.
+func readGuardedIssue(ctx context.Context, s storage.DoltStorage, id string) (*storage.GuardedIssue, error) {
+	reader, ok := s.(storage.GuardedIssueReader)
+	if !ok {
+		return nil, errors.New("configured store does not support guarded issue reads")
 	}
-	snap := &showSnapshot{}
-	if token != "" {
-		snap.guardToken = &token
-	}
-	showAfterGuardRead()
-	if snap.issue, err = s.GetIssue(ctx, id); err != nil {
-		return nil, err
-	}
-	if snap.issue == nil {
-		return nil, fmt.Errorf("%w: %s", storage.ErrNotFound, id)
-	}
-	if snap.dependencies, err = s.GetDependenciesWithMetadata(ctx, id); err != nil {
-		return nil, fmt.Errorf("dependencies: %w", err)
-	}
-	return snap, nil
+	return reader.GetGuardedIssue(ctx, id)
 }
 
 // shallowDependentsForJSON returns a copy of raw with each embedded Issue

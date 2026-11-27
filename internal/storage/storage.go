@@ -80,6 +80,20 @@ type ConditionalUpdater interface {
 	UpdateIssueConditional(ctx context.Context, id string, updates map[string]interface{}, actor string, cond UpdatePrecondition) error
 }
 
+// GuardedIssue is an issue, its outgoing dependencies and its guard token
+// ("" when none is set), all read from one transaction snapshot.
+type GuardedIssue struct {
+	Issue        *types.Issue
+	Dependencies []*types.IssueWithDependencyMetadata
+	GuardToken   string
+}
+
+// GuardedIssueReader reads the exact issue ID from the table a conditional
+// update would write, with the guard token from the same snapshot.
+type GuardedIssueReader interface {
+	GetGuardedIssue(ctx context.Context, id string) (*GuardedIssue, error)
+}
+
 // CloseClaimIntent binds an operation to exactly one expected tracker state.
 type CloseClaimIntent struct {
 	WorkItemID                string `json:"work_item_id"`

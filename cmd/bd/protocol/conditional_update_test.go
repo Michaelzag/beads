@@ -57,6 +57,7 @@ func TestProtocol_ConditionalUpdate(t *testing.T) {
 		{"claim", []string{"update", id, "--claim", "--if-guard", token}},
 		{"labels", []string{"update", id, "--status", "blocked", "--add-label", "x", "--if-guard", token}},
 		{"two ids", []string{"update", id, id, "--status", "blocked", "--if-guard", token}},
+		{"implicit undefer", []string{"update", id, "--defer", "", "--if-guard", token}},
 	} {
 		if _, _, code := w.runCAS(tc.args...); code != 1 {
 			t.Errorf("%s: exit %d; want usage failure 1", tc.name, code)
