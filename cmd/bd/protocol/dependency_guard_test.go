@@ -58,6 +58,9 @@ func TestProtocol_DependencyGuard(t *testing.T) {
 			return s
 		}
 		state := read()
+		if state.dirty != 0 {
+			t.Fatalf("expected clean tracked state before refused CAS, got %+v", state)
+		}
 		out, stderr, code := w.runCAS("update", id, "--status", "in_progress", "--if-guard", stale, "--json")
 		var got map[string]any
 		err := json.Unmarshal([]byte(out), &got)
@@ -94,6 +97,9 @@ func TestProtocol_DependencyGuard(t *testing.T) {
 		assertEdge(t, db, related, parent, types.DepRelated, 1)
 
 		w.run("delete", parent, "--force")
+		if _, err := db.ExecContext(t.Context(), "CALL DOLT_COMMIT('--allow-empty', '-Am', 'test: batch delete baseline')"); err != nil {
+			t.Fatalf("commit delete fixture: %v", err)
+		}
 
 		assertEdge(t, db, child, parent, types.DepParentChild, 0)
 		assertEdge(t, db, related, parent, types.DepRelated, 0)
@@ -112,17 +118,21 @@ func TestProtocol_DependencyGuard(t *testing.T) {
 		waiterGuard := guardOf(t, w.showJSON(waiter))
 		assertEdge(t, db, child, parent, types.DepParentChild, 0)
 
-		// Exercise the proxied CLI's graph use case and SQL repositories in
-		// a real transaction against the same database used by show/update.
+		// Mirror the graph UOW: run on one pinned connection and publish
+		// both the edges and guard cells with one Dolt commit.
 		ctx := t.Context()
-		tx, err := db.BeginTx(ctx, nil)
+		conn, err := db.Conn(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer func() { _ = tx.Rollback() }()
-		graph := domain.NewIssueUseCase(graphdb.NewIssueSQLRepository(tx), graphdb.NewDependencySQLRepository(tx),
-			graphdb.NewLabelSQLRepository(tx), graphdb.NewChildCounterSQLRepository(tx),
-			graphdb.NewCommentSQLRepository(tx), graphdb.NewConfigSQLRepository(tx))
+		defer conn.Close()
+		if _, err := conn.ExecContext(ctx, "START TRANSACTION"); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _, _ = conn.ExecContext(ctx, "ROLLBACK") }()
+		graph := domain.NewIssueUseCase(graphdb.NewIssueSQLRepository(conn), graphdb.NewDependencySQLRepository(conn),
+			graphdb.NewLabelSQLRepository(conn), graphdb.NewChildCounterSQLRepository(conn),
+			graphdb.NewCommentSQLRepository(conn), graphdb.NewConfigSQLRepository(conn))
 		_, err = graph.ApplyIssueGraph(ctx, domain.GraphPlan{
 			Nodes: []domain.GraphNode{{Key: "extra", Issue: &types.Issue{Title: "New graph node", Priority: 2, IssueType: types.TypeTask}}},
 			Edges: []domain.GraphEdge{{FromID: child, ToID: parent, Type: types.DepParentChild}},
@@ -130,7 +140,7 @@ func TestProtocol_DependencyGuard(t *testing.T) {
 		if err != nil {
 			t.Fatalf("apply graph: %v", err)
 		}
-		if err := tx.Commit(); err != nil {
+		if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'test: graph create')"); err != nil {
 			t.Fatalf("commit graph: %v", err)
 		}
 

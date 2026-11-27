@@ -74,20 +74,24 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 
 	table := pickDepTable(opts.UseWispsTable)
 
-	var existingType string
+	var edgeID, existingType string
 	var targetIsIssue, targetIsWisp bool
+	var matches int
 	err := r.runner.QueryRowContext(ctx,
 		//nolint:gosec // G201: table and depTargetExpr are hardcoded constants
-		fmt.Sprintf("SELECT type, depends_on_issue_id IS NOT NULL, depends_on_wisp_id IS NOT NULL FROM %s WHERE issue_id = ? AND %s = ?", table, depTargetExpr),
+		fmt.Sprintf("SELECT id, type, depends_on_issue_id IS NOT NULL, depends_on_wisp_id IS NOT NULL, COUNT(*) OVER () FROM %s WHERE issue_id = ? AND %s = ?", table, depTargetExpr),
 		dep.IssueID, dep.DependsOnID,
-	).Scan(&existingType, &targetIsIssue, &targetIsWisp)
+	).Scan(&edgeID, &existingType, &targetIsIssue, &targetIsWisp, &matches)
 	switch {
 	case err == nil:
+		if matches != 1 {
+			return fmt.Errorf("db: DependencySQLRepository.Insert: ambiguous dependency %s -> %s", dep.IssueID, dep.DependsOnID)
+		}
 		if existingType == string(dep.Type) {
 			//nolint:gosec // G201: table and depTargetExpr are hardcoded constants
 			if _, err := r.runner.ExecContext(ctx,
-				fmt.Sprintf("UPDATE %s SET metadata = ? WHERE issue_id = ? AND %s = ?", table, depTargetExpr),
-				metadata, dep.IssueID, dep.DependsOnID,
+				fmt.Sprintf("UPDATE %s SET metadata = ? WHERE id = ?", table),
+				metadata, edgeID,
 			); err != nil {
 				return fmt.Errorf("db: DependencySQLRepository.Insert: refresh metadata: %w", err)
 			}

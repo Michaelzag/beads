@@ -466,6 +466,9 @@ func loadBlockingDependersForIDsInTx(
 			`, t.table, targetCol)
 			rows, err := tx.QueryContext(ctx, query, id)
 			if err != nil {
+				if optionalBlockedTable(t.table) && isTableNotExistError(err) {
+					continue
+				}
 				return fmt.Errorf("%s: query: %w", t.errCtx, err)
 			}
 			for rows.Next() {
@@ -611,6 +614,9 @@ func appendChildrenInTx(
 	for _, parentID := range parentIDs {
 		rows, err := tx.QueryContext(ctx, query, parentID)
 		if err != nil {
+			if optionalBlockedTable(depTable) && isTableNotExistError(err) {
+				return nil
+			}
 			return fmt.Errorf("expand children from %s on %s: %w", depTable, parentCol, err)
 		}
 		for rows.Next() {

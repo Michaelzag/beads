@@ -46,7 +46,7 @@ func OrphanedDependencies(path string, verbose bool) error {
 	// Find orphaned dependencies (exclude external: cross-rig tracking refs, #1593)
 	//nolint:gosec // G202: fixDependencyUnionSQL returns a fixed internal SELECT fragment.
 	query := `
-		SELECT d.dep_table, d.issue_id, d.depends_on_id, d.type, d.target_is_issue, d.target_is_wisp
+		SELECT d.dep_table, d.id, d.issue_id, d.depends_on_id, d.type, d.target_is_issue, d.target_is_wisp
 		FROM (` + fixDependencyUnionSQL() + `) d
 		WHERE NOT EXISTS (SELECT 1 FROM issues i WHERE i.id = d.depends_on_id)
 		  AND NOT EXISTS (SELECT 1 FROM wisps w WHERE w.id = d.depends_on_id)
@@ -59,14 +59,14 @@ func OrphanedDependencies(path string, verbose bool) error {
 	defer rows.Close()
 
 	type orphan struct {
-		depTable, issueID, dependsOnID, depType string
-		targetIsIssue, targetIsWisp             bool
+		depTable, id, issueID, dependsOnID, depType string
+		targetIsIssue, targetIsWisp                 bool
 	}
 	var orphans []orphan
 
 	for rows.Next() {
 		var o orphan
-		if err := rows.Scan(&o.depTable, &o.issueID, &o.dependsOnID, &o.depType, &o.targetIsIssue, &o.targetIsWisp); err == nil {
+		if err := rows.Scan(&o.depTable, &o.id, &o.issueID, &o.dependsOnID, &o.depType, &o.targetIsIssue, &o.targetIsWisp); err == nil {
 			orphans = append(orphans, o)
 		}
 	}
@@ -90,9 +90,9 @@ func OrphanedDependencies(path string, verbose bool) error {
 		var err error
 		switch o.depTable {
 		case "dependencies":
-			result, err = tx.Exec("DELETE FROM dependencies WHERE issue_id = ? AND "+fixDependencyTargetExpr+" = ?", o.issueID, o.dependsOnID)
+			result, err = tx.Exec("DELETE FROM dependencies WHERE id = ?", o.id)
 		case "wisp_dependencies":
-			result, err = tx.Exec("DELETE FROM wisp_dependencies WHERE issue_id = ? AND "+fixDependencyTargetExpr+" = ?", o.issueID, o.dependsOnID)
+			result, err = tx.Exec("DELETE FROM wisp_dependencies WHERE id = ?", o.id)
 		default:
 			fmt.Printf("  Warning: skipped orphaned dependency from unexpected table %s\n", o.depTable)
 			continue
@@ -147,7 +147,7 @@ func ChildParentDependencies(path string, verbose bool) error {
 	// Excludes 'parent-child' type which is a legitimate structural hierarchy relationship.
 	//nolint:gosec // G202: fixDependencyUnionSQL returns a fixed internal SELECT fragment.
 	query := `
-		SELECT d.dep_table, d.issue_id, d.depends_on_id, d.type, d.target_is_issue, d.target_is_wisp
+		SELECT d.dep_table, d.id, d.issue_id, d.depends_on_id, d.type, d.target_is_issue, d.target_is_wisp
 		FROM (` + fixDependencyUnionSQL() + `) d
 		WHERE d.issue_id LIKE CONCAT(d.depends_on_id, '.%')
 		  AND d.type IN ('blocks', 'conditional-blocks', 'waits-for')
@@ -159,14 +159,14 @@ func ChildParentDependencies(path string, verbose bool) error {
 	defer rows.Close()
 
 	type badDep struct {
-		depTable, issueID, dependsOnID, depType string
-		targetIsIssue, targetIsWisp             bool
+		depTable, id, issueID, dependsOnID, depType string
+		targetIsIssue, targetIsWisp                 bool
 	}
 	var badDeps []badDep
 
 	for rows.Next() {
 		var d badDep
-		if err := rows.Scan(&d.depTable, &d.issueID, &d.dependsOnID, &d.depType, &d.targetIsIssue, &d.targetIsWisp); err == nil {
+		if err := rows.Scan(&d.depTable, &d.id, &d.issueID, &d.dependsOnID, &d.depType, &d.targetIsIssue, &d.targetIsWisp); err == nil {
 			badDeps = append(badDeps, d)
 		}
 	}
@@ -190,9 +190,9 @@ func ChildParentDependencies(path string, verbose bool) error {
 		var err error
 		switch d.depTable {
 		case "dependencies":
-			result, err = tx.Exec("DELETE FROM dependencies WHERE issue_id = ? AND "+fixDependencyTargetExpr+" = ? AND type = ?", d.issueID, d.dependsOnID, d.depType)
+			result, err = tx.Exec("DELETE FROM dependencies WHERE id = ?", d.id)
 		case "wisp_dependencies":
-			result, err = tx.Exec("DELETE FROM wisp_dependencies WHERE issue_id = ? AND "+fixDependencyTargetExpr+" = ? AND type = ?", d.issueID, d.dependsOnID, d.depType)
+			result, err = tx.Exec("DELETE FROM wisp_dependencies WHERE id = ?", d.id)
 		default:
 			fmt.Printf("  Warning: skipped child→parent dependency from unexpected table %s\n", d.depTable)
 			continue

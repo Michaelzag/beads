@@ -7,9 +7,9 @@ const fixDependencyTargetFlags = "depends_on_issue_id IS NOT NULL AS target_is_i
 
 func fixDependencyUnionSQL() string {
 	return `
-		SELECT 'dependencies' AS dep_table, issue_id, ` + fixDependencyTargetExpr + ` AS depends_on_id, type, ` + fixDependencyTargetFlags + `
+		SELECT 'dependencies' AS dep_table, id, issue_id, ` + fixDependencyTargetExpr + ` AS depends_on_id, type, ` + fixDependencyTargetFlags + `
 		FROM dependencies
 		UNION ALL
-		SELECT 'wisp_dependencies' AS dep_table, issue_id, ` + fixDependencyTargetExpr + ` AS depends_on_id, type, ` + fixDependencyTargetFlags + `
+		SELECT 'wisp_dependencies' AS dep_table, id, issue_id, ` + fixDependencyTargetExpr + ` AS depends_on_id, type, ` + fixDependencyTargetFlags + `
 		FROM wisp_dependencies`
 }
