@@ -523,11 +523,11 @@ func (s *EmbeddedDoltStore) GetCurrentCommit(ctx context.Context) (string, error
 // storage.HistoryViewer
 // ---------------------------------------------------------------------------
 
-func (s *EmbeddedDoltStore) History(ctx context.Context, issueID string) ([]*storage.HistoryEntry, error) {
+func (s *EmbeddedDoltStore) History(ctx context.Context, issueID string, limit int) ([]*storage.HistoryEntry, error) {
 	var result []*storage.HistoryEntry
 	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
 		var err error
-		result, err = issueops.HistoryInTx(ctx, tx, issueID)
+		result, err = issueops.HistoryInTx(ctx, tx, issueID, limit)
 		return err
 	})
 	return result, err
