@@ -122,6 +122,7 @@ var readOnlyCommands = map[string]bool{
 	"list":       true,
 	"ready":      true,
 	"show":       true,
+	"history":    true,
 	"stats":      true,
 	"blocked":    true,
 	"count":      true,
@@ -781,6 +782,7 @@ var rootCmd = &cobra.Command{
 		// Check both the command name and parent command name for subcommands
 		cmdName := cmd.Name()
 		isSubcommand := cmd.Parent() != nil && cmd.Parent().Name() != "bd"
+		isHistory := cmdName == "history"
 		skipsStoreInit := false
 		if cmd.Parent() != nil {
 			parentName := cmd.Parent().Name()
@@ -826,7 +828,7 @@ var rootCmd = &cobra.Command{
 
 		// Ambient staleness warning: if Linear data is stale, warn once per
 		// shell session on stderr. Only fires when LINEAR_API_KEY is set.
-		if cmd.Name() != "close-claim" {
+		if cmdName != "close-claim" && !isHistory {
 			maybeWarnLinearStaleness(cmd)
 		}
 
@@ -937,7 +939,8 @@ var rootCmd = &cobra.Command{
 		}
 		// The close-claim protocol must not run unrelated maintenance on
 		// lookup or replay. It expects an already provisioned database.
-		if !isCloseClaim {
+		// History must not migrate or update version tracking while reading.
+		if !isCloseClaim && !isHistory {
 			trackBdVersion()
 			// Run automatic migrations before opening the main store, including
 			// for ordinary read-only commands (bd-jgxi).
@@ -1033,10 +1036,11 @@ var rootCmd = &cobra.Command{
 
 		// Keep standalone CLI auto-start behavior centralized so doctor and
 		// other helper paths stay in lockstep with the main command path.
-		if !isCloseClaim {
-			dolt.ApplyCLIAutoStart(beadsDir, doltCfg)
-		} else if proxiedServerMode {
+		if isCloseClaim && proxiedServerMode {
 			FatalError("configured store does not support close-claim")
+		}
+		if !isCloseClaim && !isHistory {
+			dolt.ApplyCLIAutoStart(beadsDir, doltCfg)
 		}
 
 		if proxiedServerMode {
@@ -1098,9 +1102,9 @@ var rootCmd = &cobra.Command{
 			FatalError("failed to open database: %v", err)
 		}
 
-		// Mark store as active for flush goroutine safety
+		// History must not flush another command's pending batch on a signal.
 		storeMutex.Lock()
-		storeActive = true
+		storeActive = !isHistory
 		storeMutex.Unlock()
 
 		// Auto-import from issues.jsonl when embedded database is empty (GH#2994).
@@ -1145,8 +1149,8 @@ var rootCmd = &cobra.Command{
 
 		// Load molecule templates from hierarchical catalog locations
 		// Templates are loaded after auto-import to ensure the database is up-to-date.
-		// Skip for import command to avoid conflicts during import operations.
-		if !isCloseClaim && cmd.Name() != "import" && store != nil {
+		// Import and history don't need to seed the molecule catalog.
+		if !isCloseClaim && !isHistory && cmdName != "import" && store != nil {
 			beadsDir := filepath.Dir(dbPath)
 			loader := molecules.NewLoader(store)
 			if result, err := loader.LoadAll(rootCtx, beadsDir); err != nil {
@@ -1170,7 +1174,7 @@ var rootCmd = &cobra.Command{
 				_ = uowProvider.Close(rootCtx)
 				uowProvider = nil
 			}
-		} else if cmd.Name() != "close-claim" {
+		} else if cmd.Name() != "close-claim" && cmd.Name() != "history" {
 			// Dolt auto-commit: after a successful write command (and after final flush),
 			// create a Dolt commit so changes don't remain only in the working set.
 			if commandDidWrite.Load() && !commandDidExplicitDoltCommit {
