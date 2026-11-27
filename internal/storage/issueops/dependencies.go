@@ -435,6 +435,7 @@ func replaceDependencyTargetInTx(ctx context.Context, tx *sql.Tx, table, column,
 	}
 
 	rows := make([]depRow, 0)
+	var legacySources []string
 	//nolint:gosec // table and column are hardcoded by callers.
 	queryRows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external, type, created_at, created_by, metadata, thread_id
@@ -451,11 +452,19 @@ func replaceDependencyTargetInTx(ctx context.Context, tx *sql.Tx, table, column,
 			return fmt.Errorf("scan dependency target: %w", err)
 		}
 		switch column {
+		// The legacy fallback also matches rows routed to the other plane.
+		// That plane's sources were not part of the typed removal capture.
 		case "depends_on_issue_id":
+			if !row.issueTarget.Valid {
+				legacySources = append(legacySources, row.issueID)
+			}
 			row.issueTarget = sql.NullString{String: newID, Valid: true}
 			row.wispTarget = sql.NullString{}
 			row.external = sql.NullString{}
 		case "depends_on_wisp_id":
+			if !row.wispTarget.Valid {
+				legacySources = append(legacySources, row.issueID)
+			}
 			row.issueTarget = sql.NullString{}
 			row.wispTarget = sql.NullString{String: newID, Valid: true}
 			row.external = sql.NullString{}
@@ -468,6 +477,16 @@ func replaceDependencyTargetInTx(ctx context.Context, tx *sql.Tx, table, column,
 	_ = queryRows.Close()
 	if err := queryRows.Err(); err != nil {
 		return fmt.Errorf("iterate dependency targets: %w", err)
+	}
+	if len(legacySources) > 0 {
+		sourceTable, _, _, _ := WispTableRouting(table == "wisp_dependencies")
+		ids, err := appendCloseGuardIDsInTx(ctx, tx, nil, sourceTable, legacySources)
+		if err != nil {
+			return err
+		}
+		if err := BumpCloseGuardsInTx(ctx, tx, ids...); err != nil {
+			return err
+		}
 	}
 
 	//nolint:gosec // table and column are hardcoded by callers.

@@ -49,6 +49,41 @@ func BumpRemovalCloseGuardsInTx(ctx context.Context, tx *sql.Tx, issueIDs, wispI
 			}
 		}
 	}
+	// Blocking-state recomputation need not visit every row that the
+	// foreign keys (or manual wisp cleanup) will remove or retarget.
+	for _, target := range []struct {
+		column string
+		ids    []string
+	}{
+		{"depends_on_issue_id", issueIDs},
+		{"depends_on_wisp_id", wispIDs},
+	} {
+		for start := 0; start < len(target.ids); start += deleteBatchSize {
+			end := min(start+deleteBatchSize, len(target.ids))
+			inClause, args := buildSQLInClause(target.ids[start:end])
+			for _, table := range []string{"dependencies", "wisp_dependencies"} {
+				rows, err := tx.QueryContext(ctx, fmt.Sprintf("SELECT DISTINCT issue_id FROM %s WHERE %s IN (%s)", table, target.column, inClause), args...)
+				if err != nil {
+					if optionalBlockedTable(table) && isTableNotExistError(err) {
+						continue
+					}
+					return nil, nil, fmt.Errorf("read inbound close guard IDs from %s: %w", table, err)
+				}
+				for rows.Next() {
+					var id string
+					if err := rows.Scan(&id); err != nil {
+						_ = rows.Close()
+						return nil, nil, err
+					}
+					ids = append(ids, id)
+				}
+				_ = rows.Close()
+				if err := rows.Err(); err != nil {
+					return nil, nil, err
+				}
+			}
+		}
+	}
 	// Dependency rows and callers may carry a collation alias rather than
 	// the stored spelling. Include actual issue keys without discarding inputs.
 	lookupIDs := ids

@@ -54,7 +54,7 @@ func GetAllConfigInTx(ctx context.Context, tx *sql.Tx) (map[string]string, error
 }
 
 // SetMetadataInTx sets a metadata value within an existing transaction.
-func SetMetadataInTx(ctx context.Context, tx *sql.Tx, key, value string) error {
+func SetMetadataInTx(ctx context.Context, tx closeGuardWriter, key, value string) error {
 	_, err := tx.ExecContext(ctx, "REPLACE INTO metadata (`key`, value) VALUES (?, ?)", key, value)
 	if err != nil {
 		return fmt.Errorf("set metadata %s: %w", key, err)

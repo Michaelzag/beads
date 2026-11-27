@@ -1,12 +1,15 @@
 package fix
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"path/filepath"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/types"
 )
 
 // getDatabasePath returns the actual database directory path, respecting dolt_data_dir.
@@ -34,38 +37,43 @@ func OrphanedDependencies(path string, verbose bool) error {
 		return nil
 	}
 	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
 
 	// Find orphaned dependencies (exclude external: cross-rig tracking refs, #1593)
 	//nolint:gosec // G202: fixDependencyUnionSQL returns a fixed internal SELECT fragment.
 	query := `
-		SELECT d.dep_table, d.issue_id, d.depends_on_id
+		SELECT d.dep_table, d.issue_id, d.depends_on_id, d.type, d.target_is_issue, d.target_is_wisp
 		FROM (` + fixDependencyUnionSQL() + `) d
 		WHERE NOT EXISTS (SELECT 1 FROM issues i WHERE i.id = d.depends_on_id)
 		  AND NOT EXISTS (SELECT 1 FROM wisps w WHERE w.id = d.depends_on_id)
 		  AND d.depends_on_id NOT LIKE 'external:%'
 	`
-	rows, err := db.Query(query)
+	rows, err := tx.Query(query)
 	if err != nil {
 		return fmt.Errorf("failed to query orphaned dependencies: %w", err)
 	}
 	defer rows.Close()
 
 	type orphan struct {
-		depTable    string
-		issueID     string
-		dependsOnID string
+		depTable, issueID, dependsOnID, depType string
+		targetIsIssue, targetIsWisp             bool
 	}
 	var orphans []orphan
 
 	for rows.Next() {
 		var o orphan
-		if err := rows.Scan(&o.depTable, &o.issueID, &o.dependsOnID); err == nil {
+		if err := rows.Scan(&o.depTable, &o.issueID, &o.dependsOnID, &o.depType, &o.targetIsIssue, &o.targetIsWisp); err == nil {
 			orphans = append(orphans, o)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("row iteration error: %w", err)
 	}
+	_ = rows.Close()
 
 	if len(orphans) == 0 {
 		fmt.Println("  No orphaned dependencies to fix")
@@ -76,18 +84,15 @@ func OrphanedDependencies(path string, verbose bool) error {
 	// Uses explicit transaction so writes persist when @@autocommit is OFF
 	// (e.g. Dolt server started with --no-auto-commit).
 	showIndividual := verbose || len(orphans) < 20
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
 	var removed int
 	for _, o := range orphans {
+		var result sql.Result
 		var err error
 		switch o.depTable {
 		case "dependencies":
-			_, err = tx.Exec("DELETE FROM dependencies WHERE issue_id = ? AND "+fixDependencyTargetExpr+" = ?", o.issueID, o.dependsOnID)
+			result, err = tx.Exec("DELETE FROM dependencies WHERE issue_id = ? AND "+fixDependencyTargetExpr+" = ?", o.issueID, o.dependsOnID)
 		case "wisp_dependencies":
-			_, err = tx.Exec("DELETE FROM wisp_dependencies WHERE issue_id = ? AND "+fixDependencyTargetExpr+" = ?", o.issueID, o.dependsOnID)
+			result, err = tx.Exec("DELETE FROM wisp_dependencies WHERE issue_id = ? AND "+fixDependencyTargetExpr+" = ?", o.issueID, o.dependsOnID)
 		default:
 			fmt.Printf("  Warning: skipped orphaned dependency from unexpected table %s\n", o.depTable)
 			continue
@@ -95,6 +100,9 @@ func OrphanedDependencies(path string, verbose bool) error {
 		if err != nil {
 			fmt.Printf("  Warning: failed to remove %s→%s: %v\n", o.issueID, o.dependsOnID, err)
 		} else {
+			if err := guardDeletedDependency(tx, result, o.depTable, o.issueID, o.dependsOnID, o.depType, o.targetIsIssue, o.targetIsWisp); err != nil {
+				return err
+			}
 			removed++
 			if showIndividual {
 				fmt.Printf("  Removed orphaned dependency: %s→%s\n", o.issueID, o.dependsOnID)
@@ -128,40 +136,44 @@ func ChildParentDependencies(path string, verbose bool) error {
 		return nil
 	}
 	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
 
 	// Find child→parent BLOCKING dependencies where issue_id starts with depends_on_id + "."
 	// Only matches blocking types (blocks, conditional-blocks, waits-for) that cause deadlock.
 	// Excludes 'parent-child' type which is a legitimate structural hierarchy relationship.
 	//nolint:gosec // G202: fixDependencyUnionSQL returns a fixed internal SELECT fragment.
 	query := `
-		SELECT d.dep_table, d.issue_id, d.depends_on_id, d.type
+		SELECT d.dep_table, d.issue_id, d.depends_on_id, d.type, d.target_is_issue, d.target_is_wisp
 		FROM (` + fixDependencyUnionSQL() + `) d
 		WHERE d.issue_id LIKE CONCAT(d.depends_on_id, '.%')
 		  AND d.type IN ('blocks', 'conditional-blocks', 'waits-for')
 	`
-	rows, err := db.Query(query)
+	rows, err := tx.Query(query)
 	if err != nil {
 		return fmt.Errorf("failed to query child-parent dependencies: %w", err)
 	}
 	defer rows.Close()
 
 	type badDep struct {
-		depTable    string
-		issueID     string
-		dependsOnID string
-		depType     string
+		depTable, issueID, dependsOnID, depType string
+		targetIsIssue, targetIsWisp             bool
 	}
 	var badDeps []badDep
 
 	for rows.Next() {
 		var d badDep
-		if err := rows.Scan(&d.depTable, &d.issueID, &d.dependsOnID, &d.depType); err == nil {
+		if err := rows.Scan(&d.depTable, &d.issueID, &d.dependsOnID, &d.depType, &d.targetIsIssue, &d.targetIsWisp); err == nil {
 			badDeps = append(badDeps, d)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("row iteration error: %w", err)
 	}
+	_ = rows.Close()
 
 	if len(badDeps) == 0 {
 		fmt.Println("  No child→parent dependencies to fix")
@@ -172,18 +184,15 @@ func ChildParentDependencies(path string, verbose bool) error {
 	// Uses explicit transaction so writes persist when @@autocommit is OFF
 	// (e.g. Dolt server started with --no-auto-commit).
 	showIndividual := verbose || len(badDeps) < 20
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
 	var removed int
 	for _, d := range badDeps {
+		var result sql.Result
 		var err error
 		switch d.depTable {
 		case "dependencies":
-			_, err = tx.Exec("DELETE FROM dependencies WHERE issue_id = ? AND "+fixDependencyTargetExpr+" = ? AND type = ?", d.issueID, d.dependsOnID, d.depType)
+			result, err = tx.Exec("DELETE FROM dependencies WHERE issue_id = ? AND "+fixDependencyTargetExpr+" = ? AND type = ?", d.issueID, d.dependsOnID, d.depType)
 		case "wisp_dependencies":
-			_, err = tx.Exec("DELETE FROM wisp_dependencies WHERE issue_id = ? AND "+fixDependencyTargetExpr+" = ? AND type = ?", d.issueID, d.dependsOnID, d.depType)
+			result, err = tx.Exec("DELETE FROM wisp_dependencies WHERE issue_id = ? AND "+fixDependencyTargetExpr+" = ? AND type = ?", d.issueID, d.dependsOnID, d.depType)
 		default:
 			fmt.Printf("  Warning: skipped child→parent dependency from unexpected table %s\n", d.depTable)
 			continue
@@ -191,6 +200,9 @@ func ChildParentDependencies(path string, verbose bool) error {
 		if err != nil {
 			fmt.Printf("  Warning: failed to remove %s→%s: %v\n", d.issueID, d.dependsOnID, err)
 		} else {
+			if err := guardDeletedDependency(tx, result, d.depTable, d.issueID, d.dependsOnID, d.depType, d.targetIsIssue, d.targetIsWisp); err != nil {
+				return err
+			}
 			removed++
 			if showIndividual {
 				fmt.Printf("  Removed child→parent dependency: %s→%s\n", d.issueID, d.dependsOnID)
@@ -206,6 +218,20 @@ func ChildParentDependencies(path string, verbose bool) error {
 
 	fmt.Printf("  Fixed %d child→parent dependency anti-pattern(s)\n", removed)
 	return nil
+}
+
+func guardDeletedDependency(tx *sql.Tx, result sql.Result, table, source, target, depType string, targetIsIssue, targetIsWisp bool) error {
+	n, err := result.RowsAffected()
+	if err != nil || n == 0 {
+		return err
+	}
+	kind := issueops.DepTargetExternal
+	if targetIsIssue {
+		kind = issueops.DepTargetIssue
+	} else if targetIsWisp {
+		kind = issueops.DepTargetWisp
+	}
+	return issueops.BumpEdgeCloseGuardsInTx(context.Background(), tx, source, target, table == "wisp_dependencies", kind, types.DependencyType(depType))
 }
 
 // openDoltDB opens a Dolt database connection via MySQL protocol.
