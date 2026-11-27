@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -156,6 +157,54 @@ func TestServerHistory(t *testing.T) {
 		for i := range limitJSON {
 			require.True(t, bytes.Equal(allJSON[i], limitJSON[i]))
 		}
+	})
+
+	t.Run("select_only", func(t *testing.T) {
+		// Scope the account and its grants to this disposable fixture.
+		user := fmt.Sprintf("history_ro_%d", time.Now().UnixNano())
+		account := "'" + user + "'@'%'"
+		_, err := admin.ExecContext(ctx, "CREATE USER "+account)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_, err := admin.Exec("DROP USER " + account)
+			require.NoError(t, err)
+		})
+		_, err = admin.ExecContext(ctx, "GRANT SELECT ON `"+database+"`.* TO "+account)
+		require.NoError(t, err)
+
+		args := []string{"history", id, "--limit", "3", "--json"}
+		baseline := bd
+		if before := os.Getenv("BEADS_TEST_HISTORY_BEFORE_BINARY"); before != "" {
+			baseline = before
+		}
+		expected, _ := run(baseline, args...)
+		versionPath := filepath.Join(dir, ".beads", localVersionFile)
+		require.NoError(t, os.WriteFile(versionPath, []byte("0.56.0\n"), 0600))
+
+		runAsReader := func(args ...string) (bytes.Buffer, bytes.Buffer, error) {
+			t.Helper()
+			callCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(callCtx, bd, args...)
+			cmd.Dir = dir
+			cmd.Env = append(bdEnv(dir), "BEADS_DOLT_SERVER_USER="+user)
+			return runCommandBuffers(t, cmd)
+		}
+		out, stderr, err := runAsReader(args...)
+		require.NoError(t, err, "SELECT-only history: %s\n%s", out.String(), stderr.String())
+		check(out.Bytes(), want[:3])
+		require.JSONEq(t, string(expected), out.String())
+		version, err := os.ReadFile(versionPath)
+		require.NoError(t, err)
+		require.Equal(t, "0.56.0\n", string(version), "history must not write version metadata")
+		t.Log("SELECT-only history returned the same three revisions as the baseline")
+
+		out, stderr, err = runAsReader("update", id, "--title", "write must be denied")
+		require.Error(t, err)
+		failure := strings.ToLower(out.String() + stderr.String())
+		require.Contains(t, failure, "denied")
+		require.Contains(t, failure, user)
+		t.Logf("SELECT-only update was denied: %s", strings.TrimSpace(failure))
 	})
 
 	t.Run("long", func(t *testing.T) {
