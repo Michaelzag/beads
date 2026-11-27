@@ -157,7 +157,11 @@ func UpdateIssueConditionalInTx(ctx context.Context, tx *sql.Tx, id string, upda
 // update routes to, its outgoing dependencies and its guard token, all from
 // this transaction's snapshot.
 func GetGuardedIssueInTx(ctx context.Context, tx *sql.Tx, id string) (*storage.GuardedIssue, error) {
-	issueTable, labelTable, _, _ := WispTableRouting(IsActiveWispInTx(ctx, tx, id))
+	isWisp := IsActiveWispInTx(ctx, tx, id)
+	if err := rejectCrossTableIDInTx(ctx, tx, id, isWisp); err != nil {
+		return nil, err
+	}
+	issueTable, labelTable, _, _ := WispTableRouting(isWisp)
 	issue, err := getIssueFromTableInTx(ctx, tx, issueTable, labelTable, id)
 	if err != nil {
 		return nil, err
@@ -174,6 +178,24 @@ func GetGuardedIssueInTx(ctx context.Context, tx *sql.Tx, id string) (*storage.G
 		return nil, err
 	}
 	return &storage.GuardedIssue{Issue: issue, Dependencies: deps, GuardToken: guard}, nil
+}
+
+// rejectCrossTableIDInTx refuses an ID stored both as an issue and as a wisp.
+// Guarded reads and conditional writes route to the wisp, but other readers
+// (dependency edges, update output, hooks) would see the regular row.
+func rejectCrossTableIDInTx(ctx context.Context, tx *sql.Tx, id string, isWisp bool) error {
+	if !isWisp {
+		return nil
+	}
+	var one int
+	err := tx.QueryRowContext(ctx, "SELECT 1 FROM issues WHERE id = ? LIMIT 1", id).Scan(&one)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil
+	case err != nil:
+		return fmt.Errorf("check issue table for %s: %w", id, err)
+	}
+	return fmt.Errorf("%q exists as both an issue and a wisp; guarded access refused", id)
 }
 
 func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string, recordEvent bool, releaseAssignee string, cond *storage.UpdatePrecondition) (*UpdateResult, error) {
@@ -198,6 +220,9 @@ func updateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 		return nil, fmt.Errorf("%w: no issue with exact ID %q", storage.ErrNotFound, id)
 	}
 	if cond != nil {
+		if err := rejectCrossTableIDInTx(ctx, tx, id, isWisp); err != nil {
+			return nil, err
+		}
 		if err := checkUpdatePreconditionInTx(ctx, tx, oldIssue, *cond); err != nil {
 			return nil, err
 		}

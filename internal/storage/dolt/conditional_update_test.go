@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -388,34 +389,49 @@ func TestGetGuardedIssueSnapshotAcrossReparent(t *testing.T) {
 	}
 }
 
-// The guarded read returns the row a conditional update writes, even when a
-// regular issue and a wisp share an ID.
-func TestGetGuardedIssueRoutesLikeConditionalUpdate(t *testing.T) {
+// An ID stored as both a regular issue (with a parent) and a wisp (without)
+// would let other readers see a different row than the guarded one, so the
+// guarded read and the conditional update both refuse it and write nothing.
+func TestGuardedAccessRefusesCrossTableDuplicateID(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	const id, actor = "test-routed", "routing-test"
-	if err := store.CreateIssue(ctx, &types.Issue{ID: id, Title: "regular", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}, actor); err != nil {
-		t.Fatalf("create regular: %v", err)
+	const id, parent, actor = "test-dup", "test-dup-parent", "routing-test"
+	for _, issue := range []*types.Issue{
+		{ID: id, Title: "regular", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask},
+		{ID: parent, Title: parent, Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask},
+	} {
+		if err := store.CreateIssue(ctx, issue, actor); err != nil {
+			t.Fatalf("create %s: %v", issue.ID, err)
+		}
+	}
+	if err := store.AddDependency(ctx, &types.Dependency{IssueID: id, DependsOnID: parent, Type: types.DepParentChild}, actor); err != nil {
+		t.Fatalf("add parent: %v", err)
 	}
 	if err := store.CreateIssue(ctx, &types.Issue{ID: id, Title: "wisp", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask, Ephemeral: true}, actor); err != nil {
-		t.Skipf("duplicate wisp ID not creatable here: %v", err)
+		t.Fatalf("create duplicate wisp: %v", err)
 	}
-	snap, err := store.GetGuardedIssue(ctx, id)
-	if err != nil {
-		t.Fatalf("guarded read: %v", err)
+	if _, err := store.GetGuardedIssue(ctx, id); err == nil || !strings.Contains(err.Error(), "exists as both an issue and a wisp") {
+		t.Fatalf("guarded read of a duplicate ID = %v; want refusal", err)
 	}
-	if err := store.UpdateIssueConditional(ctx, id, map[string]interface{}{"notes": "cas"}, actor,
-		storage.UpdatePrecondition{Guard: strPtr(snap.GuardToken)}); err != nil {
-		t.Fatalf("conditional update: %v", err)
+	token := guardToken(ctx, t, store, id)
+	var wispNotes sql.NullString
+	if err := store.db.QueryRowContext(ctx, "SELECT notes FROM wisps WHERE id = ?", id).Scan(&wispNotes); err != nil {
+		t.Fatalf("read wisp: %v", err)
 	}
-	after, err := store.GetGuardedIssue(ctx, id)
-	if err != nil {
-		t.Fatalf("guarded read: %v", err)
+	before := readTrackerState(ctx, t, store, id)
+	err := store.UpdateIssueConditional(ctx, id, map[string]interface{}{"notes": "cas", "status": "closed"}, actor,
+		storage.UpdatePrecondition{Status: strPtr("open"), Guard: strPtr(token)})
+	if err == nil || !strings.Contains(err.Error(), "exists as both an issue and a wisp") {
+		t.Fatalf("conditional update of a duplicate ID = %v; want refusal", err)
 	}
-	if after.Issue.Title != snap.Issue.Title || after.Issue.Notes != "cas" {
-		t.Fatalf("guarded read %q/%q after CAS on the row read as %q; want the written row", after.Issue.Title, after.Issue.Notes, snap.Issue.Title)
+	if after := readTrackerState(ctx, t, store, id); !reflect.DeepEqual(before, after) {
+		t.Fatalf("refusal wrote: before = %+v, after = %+v", before, after)
+	}
+	var afterNotes sql.NullString
+	if err := store.db.QueryRowContext(ctx, "SELECT notes FROM wisps WHERE id = ?", id).Scan(&afterNotes); err != nil || afterNotes != wispNotes {
+		t.Fatalf("refusal wrote the wisp: notes %v -> %v, err = %v", wispNotes, afterNotes, err)
 	}
 }
