@@ -7,8 +7,10 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/steveyegge/beads/internal/types"
@@ -39,6 +41,57 @@ type ReleaseClaimRefusal struct {
 
 func (e *ReleaseClaimRefusal) Error() string {
 	return "claim release refused: " + string(e.Reason)
+}
+
+// CloseGuardKey names the metadata cell that guarded writers set to a fresh
+// UUID for the exact issue ID. Its value is the issue's guard token.
+func CloseGuardKey(id string) string {
+	return fmt.Sprintf("_close_guard_v1:%x", sha256.Sum256([]byte(id)))
+}
+
+// UpdatePrecondition is compared with the issue inside the writing
+// transaction. A nil field is not checked; an empty Guard expects no guard.
+type UpdatePrecondition struct {
+	Status *string
+	Guard  *string
+}
+
+// UpdatePreconditionFailed reports a definitive no-write conditional update.
+// An empty Actual guard means the issue has no guard token.
+type UpdatePreconditionFailed struct {
+	Field    string
+	Expected string
+	Actual   string
+}
+
+func (e *UpdatePreconditionFailed) Error() string {
+	return fmt.Sprintf("precondition_failed: %s is %s, expected %s", e.Field, preconditionValue(e.Actual), preconditionValue(e.Expected))
+}
+
+func preconditionValue(v string) string {
+	if v == "" {
+		return "<none>"
+	}
+	return v
+}
+
+// ConditionalUpdater is supported by the direct Dolt backends.
+type ConditionalUpdater interface {
+	UpdateIssueConditional(ctx context.Context, id string, updates map[string]interface{}, actor string, cond UpdatePrecondition) error
+}
+
+// GuardedIssue is an issue, its outgoing dependencies and its guard token
+// ("" when none is set), all read from one transaction snapshot.
+type GuardedIssue struct {
+	Issue        *types.Issue
+	Dependencies []*types.IssueWithDependencyMetadata
+	GuardToken   string
+}
+
+// GuardedIssueReader reads the exact issue ID from the table a conditional
+// update would write, with the guard token from the same snapshot.
+type GuardedIssueReader interface {
+	GetGuardedIssue(ctx context.Context, id string) (*GuardedIssue, error)
 }
 
 // CloseClaimIntent binds an operation to exactly one expected tracker state.

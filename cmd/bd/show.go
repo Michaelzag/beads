@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/uimd"
@@ -143,11 +145,23 @@ var showCmd = &cobra.Command{
 			}
 
 			if jsonOutput {
+				// Status, parent edge and guard_token come from one snapshot, so
+				// update --if-guard refuses if any of them changed since.
+				snap, err := readGuardedIssue(ctx, issueStore, issue.ID)
+				if err != nil {
+					result.Close()
+					FatalErrorRespectJSON("reading %s: %v", id, err)
+				}
+				issue = snap.Issue
+				var guardToken *string
+				if snap.GuardToken != "" {
+					guardToken = &snap.GuardToken
+				}
 				// be-ijck6q: default is count-only (no dependents/comments slice in output).
 				// Use --include-dependents / --include-comments to stream the full lists.
 				details := &types.IssueDetails{Issue: *issue}
 				details.Labels, _ = issueStore.GetLabels(ctx, issue.ID)
-				details.Dependencies, _ = issueStore.GetDependenciesWithMetadata(ctx, issue.ID)
+				details.Dependencies = snap.Dependencies
 
 				// Aggregate counts — O(1) queries, no row materialization.
 				depCount, _ := issueStore.CountDependents(ctx, issue.ID)
@@ -219,7 +233,7 @@ var showCmd = &cobra.Command{
 						break
 					}
 				}
-				allDetails = append(allDetails, details)
+				allDetails = append(allDetails, &showIssueJSON{IssueDetails: details, GuardToken: guardToken})
 				result.Close()
 				continue
 			}
@@ -430,6 +444,24 @@ var showCmd = &cobra.Command{
 			SetLastTouchedID(args[0])
 		}
 	},
+}
+
+// showIssueJSON adds the issue's guard token to show --json. A null token
+// means no guarded writer has set one; update --if-guard "" expects that.
+type showIssueJSON struct {
+	*types.IssueDetails
+	GuardToken *string `json:"guard_token"`
+}
+
+// readGuardedIssue reads the issue (routed as update --if-guard routes), its
+// dependency edges and its guard token from one transaction snapshot, so the
+// returned status and parent are exactly the state the token stands for.
+func readGuardedIssue(ctx context.Context, s storage.DoltStorage, id string) (*storage.GuardedIssue, error) {
+	reader, ok := s.(storage.GuardedIssueReader)
+	if !ok {
+		return nil, errors.New("configured store does not support guarded issue reads")
+	}
+	return reader.GetGuardedIssue(ctx, id)
 }
 
 // shallowDependentsForJSON returns a copy of raw with each embedded Issue

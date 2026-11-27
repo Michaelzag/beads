@@ -1468,6 +1468,8 @@ bd update [id...] [flags]
   -e, --estimate int                 Time estimate in minutes (e.g., 60 for 1 hour)
       --external-ref string          External reference (e.g., 'gh-9', 'jira-ABC', Linear URL)
       --history                      Clear no-history flag (re-enable Dolt commit history)
+      --if-guard string              Apply the update only if the issue's guard_token (from show --json) equals this value; empty expects none
+      --if-status string             Apply the update only if the issue's current status equals this value
       --metadata string              Set custom metadata (JSON string or @file.json to read from file)
       --no-history                   Mark issue as no-history (skip Dolt commits, not GC-eligible)
       --notes string                 Additional notes

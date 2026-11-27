@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -28,6 +30,11 @@ create, update, show, or close operation).`,
 	Args: cobra.MinimumNArgs(0),
 	Run: func(cmd *cobra.Command, args []string) {
 		CheckReadonly("update")
+
+		cond, err := updatePreconditionFromFlags(cmd, args)
+		if err != nil {
+			FatalErrorRespectJSON("%v", err)
+		}
 
 		// If no IDs provided, use last touched issue
 		if len(args) == 0 {
@@ -285,8 +292,16 @@ create, update, show, or close operation).`,
 		claimFlag, _ := cmd.Flags().GetBool("claim")
 
 		if len(updates) == 0 && !claimFlag {
+			if cond != nil {
+				FatalErrorRespectJSON("--if-status/--if-guard require a field update")
+			}
 			fmt.Println("No updates specified")
 			return
+		}
+		if cond != nil && clearDeferStatus {
+			// The implicit undefer status would come from a read outside the
+			// conditional transaction.
+			FatalErrorRespectJSON("--defer \"\" with --if-status/--if-guard requires an explicit --status")
 		}
 
 		ctx := rootCtx
@@ -370,7 +385,18 @@ create, update, show, or close operation).`,
 				regularUpdates["notes"] = combined
 			}
 			if len(regularUpdates) > 0 {
-				if err := issueStore.UpdateIssue(ctx, result.ResolvedID, regularUpdates, actor); err != nil {
+				if cond != nil {
+					err = updateIssueConditional(ctx, issueStore, result.ResolvedID, regularUpdates, *cond)
+				} else {
+					err = issueStore.UpdateIssue(ctx, result.ResolvedID, regularUpdates, actor)
+				}
+				if err != nil {
+					var failed *storage.UpdatePreconditionFailed
+					if errors.As(err, &failed) {
+						result.Close()
+						reportUpdatePreconditionFailed(result.ResolvedID, failed)
+						os.Exit(3)
+					}
 					fmt.Fprintf(os.Stderr, "Error updating %s: %v\n", id, err)
 					result.Close()
 					continue
@@ -495,6 +521,74 @@ create, update, show, or close operation).`,
 			os.Exit(1)
 		}
 	},
+}
+
+// conditionalUpdateExclusions run outside the single storage transaction that
+// checks the precondition, or derive values from a read outside it.
+var conditionalUpdateExclusions = []string{
+	"claim", "add-label", "remove-label", "set-labels", "parent", "append-notes",
+	"metadata", "set-metadata", "unset-metadata", "ephemeral", "persistent", "no-history", "history",
+}
+
+// updatePreconditionFromFlags returns nil for a plain update. A conditional
+// update is one exact write, checked in the transaction that applies it.
+func updatePreconditionFromFlags(cmd *cobra.Command, args []string) (*storage.UpdatePrecondition, error) {
+	flags := cmd.Flags()
+	if !flags.Changed("if-status") && !flags.Changed("if-guard") {
+		return nil, nil
+	}
+	if len(args) != 1 {
+		return nil, errors.New("--if-status/--if-guard require exactly one issue ID")
+	}
+	for _, name := range conditionalUpdateExclusions {
+		if flags.Changed(name) {
+			return nil, fmt.Errorf("--if-status/--if-guard cannot be combined with --%s", name)
+		}
+	}
+	var cond storage.UpdatePrecondition
+	if flags.Changed("if-status") {
+		status, _ := flags.GetString("if-status")
+		if status == "" {
+			return nil, errors.New("--if-status requires a status")
+		}
+		cond.Status = &status
+	}
+	if flags.Changed("if-guard") {
+		guard, _ := flags.GetString("if-guard")
+		cond.Guard = &guard
+	}
+	return &cond, nil
+}
+
+func updateIssueConditional(ctx context.Context, s storage.DoltStorage, id string, updates map[string]interface{}, cond storage.UpdatePrecondition) error {
+	updater, ok := s.(storage.ConditionalUpdater)
+	if !ok {
+		return errors.New("configured store does not support conditional update")
+	}
+	return updater.UpdateIssueConditional(ctx, id, updates, actor, cond)
+}
+
+// reportUpdatePreconditionFailed writes the machine-readable refusal. The
+// caller exits 3; nothing was written.
+func reportUpdatePreconditionFailed(id string, failed *storage.UpdatePreconditionFailed) {
+	fmt.Fprintln(os.Stderr, failed.Error())
+	if !jsonOutput {
+		return
+	}
+	value := func(v string) any {
+		if v == "" {
+			return nil
+		}
+		return v
+	}
+	outputJSONRaw(map[string]any{
+		"outcome":      "refused",
+		"reason":       "precondition_failed",
+		"work_item_id": id,
+		"field":        failed.Field,
+		"expected":     value(failed.Expected),
+		"actual":       value(failed.Actual),
+	})
 }
 
 // mergeMetadata merges new metadata JSON into existing metadata.
@@ -631,6 +725,8 @@ func init() {
 	// Incremental metadata edits (GH#1406)
 	updateCmd.Flags().StringArray("set-metadata", nil, "Set metadata key=value (repeatable, e.g., --set-metadata team=platform)")
 	updateCmd.Flags().StringArray("unset-metadata", nil, "Remove metadata key (repeatable, e.g., --unset-metadata team)")
+	updateCmd.Flags().String("if-status", "", "Apply the update only if the issue's current status equals this value")
+	updateCmd.Flags().String("if-guard", "", "Apply the update only if the issue's guard_token (from show --json) equals this value; empty expects none")
 	updateCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(updateCmd)
 }

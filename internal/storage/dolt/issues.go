@@ -196,6 +196,46 @@ func (s *DoltStore) UpdateIssue(ctx context.Context, id string, updates map[stri
 	return nil
 }
 
+// UpdateIssueConditional applies updates only if cond holds in the writing
+// transaction, replacing the issue's guard token in the same transaction.
+// A Dolt commit conflict retries, so a concurrent winner is seen as a refusal.
+func (s *DoltStore) UpdateIssueConditional(ctx context.Context, id string, updates map[string]interface{}, actor string, cond storage.UpdatePrecondition) error {
+	if rawMeta, ok := updates["metadata"]; ok {
+		metadataStr, err := storage.NormalizeMetadataValue(rawMeta)
+		if err != nil {
+			return fmt.Errorf("invalid metadata: %w", err)
+		}
+		if err := validateMetadataIfConfigured(json.RawMessage(metadataStr)); err != nil {
+			return err
+		}
+	}
+	return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+		result, err := issueops.UpdateIssueConditionalInTx(ctx, tx, id, updates, actor, cond)
+		if err != nil {
+			return err
+		}
+		// The guard lives in tracked metadata even for wisps, and a wisp status
+		// change may update a regular issue's blocker state.
+		tables := []string{"issues", "metadata"}
+		if !result.IsWisp {
+			tables = append(tables, "events")
+		}
+		return s.doltAddAndCommitInTx(ctx, tx, tables, fmt.Sprintf("bd: update %s", id))
+	})
+}
+
+// GetGuardedIssue reads an issue, its dependencies and its guard token in one
+// read transaction, routed as UpdateIssueConditional routes.
+func (s *DoltStore) GetGuardedIssue(ctx context.Context, id string) (*storage.GuardedIssue, error) {
+	var result *storage.GuardedIssue
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetGuardedIssueInTx(ctx, tx, id)
+		return err
+	})
+	return result, err
+}
+
 // ClaimIssue atomically claims an issue using compare-and-swap semantics.
 // It sets the assignee to actor and status to "in_progress" only if the issue
 // currently has no assignee. Returns storage.ErrAlreadyClaimed if already claimed.

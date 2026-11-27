@@ -107,6 +107,28 @@ func (h *HookFiringStore) UpdateIssue(ctx context.Context, id string, updates ma
 	return nil
 }
 
+// UpdateIssueConditional applies a conditional update and fires on_update.
+func (h *HookFiringStore) UpdateIssueConditional(ctx context.Context, id string, updates map[string]interface{}, actor string, cond UpdatePrecondition) error {
+	store, ok := h.inner.(ConditionalUpdater)
+	if !ok {
+		return errors.New("store does not support conditional update")
+	}
+	if err := store.UpdateIssueConditional(ctx, id, updates, actor, cond); err != nil {
+		return err
+	}
+	h.fireHookByID(ctx, hooks.EventUpdate, id)
+	return nil
+}
+
+// GetGuardedIssue reads through to the inner store; it fires no hook.
+func (h *HookFiringStore) GetGuardedIssue(ctx context.Context, id string) (*GuardedIssue, error) {
+	store, ok := h.inner.(GuardedIssueReader)
+	if !ok {
+		return nil, errors.New("store does not support guarded issue reads")
+	}
+	return store.GetGuardedIssue(ctx, id)
+}
+
 // ReleaseClaim fires on_update only when a claim was newly released.
 func (h *HookFiringStore) ReleaseClaim(ctx context.Context, id, expectedAssignee, operationID, actor string) error {
 	_, err := h.ReleaseClaimWithResult(ctx, id, expectedAssignee, operationID, actor)

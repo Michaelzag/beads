@@ -2,13 +2,13 @@ package issueops
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 // BumpCloseGuardsInTx makes overlapping writers of close predicates contend on
@@ -25,7 +25,7 @@ func BumpCloseGuardsInTx(ctx context.Context, tx *sql.Tx, ids ...string) error {
 		if err != nil {
 			return fmt.Errorf("generate close guard for %s: %w", id, err)
 		}
-		key := fmt.Sprintf("_close_guard_v1:%x", sha256.Sum256([]byte(id)))
+		key := storage.CloseGuardKey(id)
 		if err := SetMetadataInTx(ctx, tx, key, nonce.String()); err != nil {
 			return fmt.Errorf("bump close guard for %s: %w", id, err)
 		}
