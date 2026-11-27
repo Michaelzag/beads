@@ -15,8 +15,8 @@ var historyCmd = &cobra.Command{
 	Use:     "history <id>",
 	GroupID: "views",
 	Short:   "Show version history for an issue",
-	Long: `Show the complete version history of an issue, including all commits
-where the issue was modified.
+	Long: `Show the committed revisions of an issue, newest first.
+Unrelated commits do not repeat the issue snapshot.
 
 Examples:
   bd history bd-123           # Show all history for issue bd-123
@@ -26,8 +26,7 @@ Examples:
 		ctx := rootCtx
 		issueID := args[0]
 
-		// Get issue history
-		history, err := store.History(ctx, issueID)
+		history, err := store.History(ctx, issueID, historyLimit)
 		if err != nil {
 			FatalErrorRespectJSON("failed to get history: %v", err)
 		}
@@ -41,11 +40,6 @@ Examples:
 			}
 			fmt.Printf("No history found for issue %s\n", issueID)
 			return
-		}
-
-		// Apply limit only to non-empty history; slicing an empty slice is a no-op.
-		if historyLimit > 0 && historyLimit < len(history) {
-			history = history[:historyLimit]
 		}
 
 		if jsonOutput {

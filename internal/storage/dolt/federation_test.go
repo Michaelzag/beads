@@ -297,7 +297,7 @@ func TestFederationHistoryQueries(t *testing.T) {
 	}
 
 	// Query history
-	history, err := store.History(ctx, "hist-001")
+	history, err := store.History(ctx, "hist-001", 0)
 	if err != nil {
 		t.Fatalf("failed to get history: %v", err)
 	}

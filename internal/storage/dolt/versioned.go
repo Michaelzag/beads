@@ -11,12 +11,12 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// History returns the complete version history for an issue.
-func (s *DoltStore) History(ctx context.Context, issueID string) ([]*storage.HistoryEntry, error) {
+// History returns committed revisions of an issue, newest first.
+func (s *DoltStore) History(ctx context.Context, issueID string, limit int) ([]*storage.HistoryEntry, error) {
 	var result []*storage.HistoryEntry
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
 		var err error
-		result, err = issueops.HistoryInTx(ctx, tx, issueID)
+		result, err = issueops.HistoryInTx(ctx, tx, issueID, limit)
 		if err != nil {
 			return wrapQueryError("get issue history", err)
 		}

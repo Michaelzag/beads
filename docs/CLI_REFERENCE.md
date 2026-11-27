@@ -1613,8 +1613,8 @@ bd find-duplicates [flags]
 
 ### bd history
 
-Show the complete version history of an issue, including all commits
-where the issue was modified.
+Show the committed revisions of an issue, newest first.
+Unrelated commits do not repeat the issue snapshot.
 
 Examples:
   bd history bd-123           # Show all history for issue bd-123

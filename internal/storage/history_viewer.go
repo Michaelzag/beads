@@ -8,7 +8,8 @@ import (
 
 // HistoryViewer provides time-travel queries and diffs.
 type HistoryViewer interface {
-	History(ctx context.Context, issueID string) ([]*HistoryEntry, error)
+	// History returns committed issue revisions, newest first. A nonpositive limit returns all.
+	History(ctx context.Context, issueID string, limit int) ([]*HistoryEntry, error)
 	AsOf(ctx context.Context, issueID string, ref string) (*types.Issue, error)
 	Diff(ctx context.Context, fromRef, toRef string) ([]*DiffEntry, error)
 }
