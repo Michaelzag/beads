@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 func TestReplaceDependencyTargetNormalizesTargetColumns(t *testing.T) {
@@ -69,6 +70,12 @@ func TestReplaceDependencyTargetNormalizesTargetColumns(t *testing.T) {
 					"metadata",
 					"thread_id",
 				}).AddRow("source", tt.rowIssue, tt.rowWisp, nil, "blocks", nil, "tester", "{}", "thread-1"))
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT (SELECT id FROM issues WHERE id = ?)")).
+				WithArgs("source").
+				WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("source"))
+			mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO metadata (`key`, value) VALUES (?, ?)")).
+				WithArgs(storage.CloseGuardKey("source"), sqlmock.AnyArg()).
+				WillReturnResult(sqlmock.NewResult(0, 1))
 			mock.ExpectExec(regexp.QuoteMeta("DELETE FROM dependencies")).
 				WithArgs("old-target", "old-target").
 				WillReturnResult(sqlmock.NewResult(0, 1))

@@ -187,14 +187,19 @@ func AddDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 	// Check for existing dependency between the same pair. Use the resolved
 	// target expression defensively so stale/reclassified rows in another typed
 	// target column cannot bypass the idempotency/conflict check.
-	var existingType string
+	var edgeID, existingType string
+	var storedTargetIsIssue, storedTargetIsWisp bool
+	var matches int
 	//nolint:gosec // G201: writeTable from WispTableRouting; depTargetEquals has no user input.
-	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT type FROM %s WHERE issue_id = ? AND %s`, writeTable, depTargetEquals("")),
-		dep.IssueID, dep.DependsOnID).Scan(&existingType)
+	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT id, type, depends_on_issue_id IS NOT NULL, depends_on_wisp_id IS NOT NULL, COUNT(*) OVER () FROM %s WHERE issue_id = ? AND %s`, writeTable, depTargetEquals("")),
+		dep.IssueID, dep.DependsOnID).Scan(&edgeID, &existingType, &storedTargetIsIssue, &storedTargetIsWisp, &matches)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("failed to check existing dependency: %w", err)
 	}
 	exists := err == nil
+	if exists && matches != 1 {
+		return fmt.Errorf("ambiguous dependency %s -> %s", dep.IssueID, dep.DependsOnID)
+	}
 	if exists && existingType != string(dep.Type) {
 		return fmt.Errorf("dependency %s -> %s already exists with type %q (requested %q); remove it first with 'bd dep remove' then re-add",
 			dep.IssueID, dep.DependsOnID, existingType, dep.Type)
@@ -205,19 +210,25 @@ func AddDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 	if srcIsWisp {
 		affectedByChange = AffectedByDepChangeForWispInTx
 	}
-	beforeIssues, beforeWisps, err := affectedByChange(ctx, tx, sourceID, targetID, dep.Type)
-	if err != nil {
-		return fmt.Errorf("affected before add dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)
-	}
 	if exists {
 		// Same type — idempotent; update metadata. Waits-for metadata can
 		// change the close predicate without changing the edge's endpoints.
-		//nolint:gosec // G201: writeTable from WispTableRouting; depTargetEquals has no user input.
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET metadata = ? WHERE issue_id = ? AND %s`, writeTable, depTargetEquals("")),
-			metadata, dep.IssueID, dep.DependsOnID); err != nil {
+		//nolint:gosec // G201: writeTable comes from WispTableRouting.
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET metadata = ? WHERE id = ?`, writeTable),
+			metadata, edgeID); err != nil {
 			return fmt.Errorf("failed to update dependency metadata: %w", err)
 		}
-		return BumpDependencyCloseGuardsInTx(ctx, tx, sourceID, targetID, beforeIssues, beforeWisps, nil, nil)
+		storedKind := DepTargetExternal
+		if storedTargetIsIssue {
+			storedKind = DepTargetIssue
+		} else if storedTargetIsWisp {
+			storedKind = DepTargetWisp
+		}
+		return BumpEdgeCloseGuardsInTx(ctx, tx, sourceID, dep.DependsOnID, srcIsWisp, storedKind, dep.Type)
+	}
+	beforeIssues, beforeWisps, err := affectedByChange(ctx, tx, sourceID, targetID, dep.Type)
+	if err != nil {
+		return fmt.Errorf("affected before add dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)
 	}
 
 	//nolint:gosec // G201: writeTable from WispTableRouting; targetCol from DepTargetKind.Column()
@@ -435,6 +446,7 @@ func replaceDependencyTargetInTx(ctx context.Context, tx *sql.Tx, table, column,
 	}
 
 	rows := make([]depRow, 0)
+	var legacySources []string
 	//nolint:gosec // table and column are hardcoded by callers.
 	queryRows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT issue_id, depends_on_issue_id, depends_on_wisp_id, depends_on_external, type, created_at, created_by, metadata, thread_id
@@ -451,11 +463,19 @@ func replaceDependencyTargetInTx(ctx context.Context, tx *sql.Tx, table, column,
 			return fmt.Errorf("scan dependency target: %w", err)
 		}
 		switch column {
+		// The legacy fallback also matches rows routed to the other plane.
+		// That plane's sources were not part of the typed removal capture.
 		case "depends_on_issue_id":
+			if !row.issueTarget.Valid {
+				legacySources = append(legacySources, row.issueID)
+			}
 			row.issueTarget = sql.NullString{String: newID, Valid: true}
 			row.wispTarget = sql.NullString{}
 			row.external = sql.NullString{}
 		case "depends_on_wisp_id":
+			if !row.wispTarget.Valid {
+				legacySources = append(legacySources, row.issueID)
+			}
 			row.issueTarget = sql.NullString{}
 			row.wispTarget = sql.NullString{String: newID, Valid: true}
 			row.external = sql.NullString{}
@@ -468,6 +488,16 @@ func replaceDependencyTargetInTx(ctx context.Context, tx *sql.Tx, table, column,
 	_ = queryRows.Close()
 	if err := queryRows.Err(); err != nil {
 		return fmt.Errorf("iterate dependency targets: %w", err)
+	}
+	if len(legacySources) > 0 {
+		sourceTable, _, _, _ := WispTableRouting(table == "wisp_dependencies")
+		ids, err := appendCloseGuardIDsInTx(ctx, tx, nil, sourceTable, legacySources)
+		if err != nil {
+			return err
+		}
+		if err := BumpCloseGuardsInTx(ctx, tx, ids...); err != nil {
+			return err
+		}
 	}
 
 	//nolint:gosec // table and column are hardcoded by callers.
@@ -629,41 +659,47 @@ func checkRenameTargetCollision(ctx context.Context, tx *sql.Tx, table, typedCol
 //nolint:gosec // G201: depTable from WispTableRouting (hardcoded constants)
 func RemoveDependencyInTx(ctx context.Context, tx *sql.Tx, issueID, dependsOnID string) error {
 	isWisp := IsActiveWispInTx(ctx, tx, issueID)
-	issueTable, _, _, depTable := WispTableRouting(isWisp)
+	_, _, _, depTable := WispTableRouting(isWisp)
 
-	// Capture the row's type before deleting so we can dispatch the right
-	// affected-set helper. If no row matches, treat as a no-op.
-	var sourceID, targetID, depType string
-	var targetIsIssue, targetIsWisp bool
-	row := tx.QueryRowContext(ctx, fmt.Sprintf(
+	// The same display ID can match typed targets in more than one plane.
+	// Capture every matching row before the deletion.
+	type matchedEdge struct {
+		source, target              string
+		depType                     types.DependencyType
+		targetIsIssue, targetIsWisp bool
+	}
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(
 		`SELECT issue_id, %s, type, depends_on_issue_id IS NOT NULL, depends_on_wisp_id IS NOT NULL FROM %s WHERE issue_id = ? AND %s = ?`,
-		DepTargetExpr, depTable, DepTargetExpr),
-		issueID, dependsOnID)
-	if err := row.Scan(&sourceID, &targetID, &depType, &targetIsIssue, &targetIsWisp); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
-		}
-		return fmt.Errorf("lookup dependency type for %s -> %s: %w", issueID, dependsOnID, err)
-	}
-
-	sourceID, err := closeGuardIssueIDInTx(ctx, tx, issueTable, sourceID)
+		DepTargetExpr, depTable, DepTargetExpr), issueID, dependsOnID)
 	if err != nil {
-		return err
+		return fmt.Errorf("lookup dependency %s -> %s: %w", issueID, dependsOnID, err)
 	}
-	if targetIsIssue || targetIsWisp {
-		targetTable, _, _, _ := WispTableRouting(targetIsWisp)
-		targetID, err = closeGuardIssueIDInTx(ctx, tx, targetTable, targetID)
-		if err != nil {
+	defer rows.Close()
+	var edges []matchedEdge
+	for rows.Next() {
+		var edge matchedEdge
+		if err := rows.Scan(&edge.source, &edge.target, &edge.depType, &edge.targetIsIssue, &edge.targetIsWisp); err != nil {
 			return err
 		}
+		edges = append(edges, edge)
 	}
-	affectedByChange := AffectedByDepChangeInTx
-	if isWisp {
-		affectedByChange = AffectedByDepChangeForWispInTx
+	if err := rows.Err(); err != nil {
+		return err
 	}
-	beforeIssues, beforeWisps, err := affectedByChange(ctx, tx, sourceID, targetID, types.DependencyType(depType))
-	if err != nil {
-		return fmt.Errorf("affected before remove dependency %s -> %s: %w", issueID, dependsOnID, err)
+	_ = rows.Close()
+	if len(edges) == 0 {
+		return nil
+	}
+	for _, edge := range edges {
+		kind := DepTargetExternal
+		if edge.targetIsIssue {
+			kind = DepTargetIssue
+		} else if edge.targetIsWisp {
+			kind = DepTargetWisp
+		}
+		if err := BumpEdgeCloseGuardsInTx(ctx, tx, edge.source, edge.target, isWisp, kind, edge.depType); err != nil {
+			return err
+		}
 	}
 
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(
@@ -672,12 +708,18 @@ func RemoveDependencyInTx(ctx context.Context, tx *sql.Tx, issueID, dependsOnID 
 		return fmt.Errorf("remove dependency: %w", err)
 	}
 
-	affectedIssues, affectedWisps, err := affectedByChange(ctx, tx, sourceID, targetID, types.DependencyType(depType))
-	if err != nil {
-		return fmt.Errorf("affected by remove dependency %s -> %s: %w", issueID, dependsOnID, err)
+	affectedByChange := AffectedByDepChangeInTx
+	if isWisp {
+		affectedByChange = AffectedByDepChangeForWispInTx
 	}
-	if err := BumpDependencyCloseGuardsInTx(ctx, tx, sourceID, targetID, beforeIssues, beforeWisps, affectedIssues, affectedWisps); err != nil {
-		return err
+	var affectedIssues, affectedWisps []string
+	for _, edge := range edges {
+		issues, wisps, err := affectedByChange(ctx, tx, edge.source, edge.target, edge.depType)
+		if err != nil {
+			return fmt.Errorf("affected by remove dependency %s -> %s: %w", issueID, dependsOnID, err)
+		}
+		affectedIssues = append(affectedIssues, issues...)
+		affectedWisps = append(affectedWisps, wisps...)
 	}
 	if err := RecomputeIsBlockedInTx(ctx, tx, affectedIssues, affectedWisps); err != nil {
 		return fmt.Errorf("recompute is_blocked after remove dependency %s -> %s: %w", issueID, dependsOnID, err)

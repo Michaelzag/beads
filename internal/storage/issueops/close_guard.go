@@ -9,12 +9,30 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/types"
 )
+
+type edgeQueryRunner interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+type closeGuardWriter interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+type closeGuardReader interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+type closeGuardRunner interface {
+	closeGuardWriter
+	closeGuardReader
+}
 
 // BumpCloseGuardsInTx makes overlapping writers of close predicates contend on
 // the same metadata cell per exact issue ID. Values must differ even for retries
 // of the same operation, since Dolt can merge identical writes.
-func BumpCloseGuardsInTx(ctx context.Context, tx *sql.Tx, ids ...string) error {
+func BumpCloseGuardsInTx(ctx context.Context, tx closeGuardWriter, ids ...string) error {
 	if len(ids) > 1 {
 		ids = slices.Clone(ids)
 		slices.Sort(ids)
@@ -91,7 +109,7 @@ func statusCloseGuardIDsInTx(ctx context.Context, tx *sql.Tx, id string, affecte
 
 // BumpDependencyCloseGuardsInTx guards both endpoints and the blocker readers
 // discovered before and after a dependency mutation.
-func BumpDependencyCloseGuardsInTx(ctx context.Context, tx *sql.Tx, source, target string, beforeIssues, beforeWisps, afterIssues, afterWisps []string) error {
+func BumpDependencyCloseGuardsInTx(ctx context.Context, tx closeGuardRunner, source, target string, beforeIssues, beforeWisps, afterIssues, afterWisps []string) error {
 	ids := make([]string, 0, 2+len(beforeIssues)+len(beforeWisps)+len(afterIssues)+len(afterWisps))
 	ids = append(ids, source, target)
 	ids, err := appendCloseGuardIDsInTx(ctx, tx, ids, "issues", beforeIssues, afterIssues)
@@ -105,12 +123,41 @@ func BumpDependencyCloseGuardsInTx(ctx context.Context, tx *sql.Tx, source, targ
 	return BumpCloseGuardsInTx(ctx, tx, ids...)
 }
 
+// BumpEdgeCloseGuardsInTx guards exact edge endpoints and predicate readers.
+// The SQL runner must be bound to the same transaction as the edge write.
+func BumpEdgeCloseGuardsInTx(ctx context.Context, tx interface {
+	edgeQueryRunner
+	closeGuardRunner
+}, source, target string, sourceIsWisp bool, targetKind DepTargetKind, depType types.DependencyType) error {
+	sourceTable, _, _, _ := WispTableRouting(sourceIsWisp)
+	source, err := closeGuardIssueIDInTx(ctx, tx, sourceTable, source)
+	if err != nil {
+		return err
+	}
+	if targetKind != DepTargetExternal {
+		targetTable, _, _, _ := WispTableRouting(targetKind == DepTargetWisp)
+		target, err = closeGuardIssueIDInTx(ctx, tx, targetTable, target)
+		if err != nil {
+			return err
+		}
+	}
+	affected := AffectedByDepChangeInTx
+	if sourceIsWisp {
+		affected = AffectedByDepChangeForWispInTx
+	}
+	issues, wisps, err := affected(ctx, tx, source, target, depType)
+	if err != nil {
+		return err
+	}
+	return BumpDependencyCloseGuardsInTx(ctx, tx, source, target, issues, wisps, nil, nil)
+}
+
 // appendCloseGuardIDsInTx resolves graph-derived IDs in their source table.
 // Batch indexed point lookups preserve the column's collation without changing
 // the input spelling of a dangling ID.
 //
 //nolint:gosec // G201: issueTable is one of two hardcoded constants.
-func appendCloseGuardIDsInTx(ctx context.Context, tx *sql.Tx, ids []string, issueTable string, groups ...[]string) ([]string, error) {
+func appendCloseGuardIDsInTx(ctx context.Context, tx closeGuardReader, ids []string, issueTable string, groups ...[]string) ([]string, error) {
 	graphIDs := slices.Concat(groups...)
 	if len(graphIDs) == 0 {
 		return ids, nil
@@ -142,7 +189,7 @@ func appendCloseGuardIDsInTx(ctx context.Context, tx *sql.Tx, ids []string, issu
 // by normal SQL collation. A dangling edge may be removed without an issue row.
 //
 //nolint:gosec // G201: issueTable comes from WispTableRouting.
-func closeGuardIssueIDInTx(ctx context.Context, tx *sql.Tx, issueTable, id string) (string, error) {
+func closeGuardIssueIDInTx(ctx context.Context, tx closeGuardReader, issueTable, id string) (string, error) {
 	var exactID string
 	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT id FROM %s WHERE id = ?`, issueTable), id).Scan(&exactID)
 	if err == sql.ErrNoRows {

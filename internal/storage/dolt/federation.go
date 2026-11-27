@@ -12,6 +12,7 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 )
 
@@ -399,24 +400,55 @@ func (s *DoltStore) filteredPushToPeer(ctx context.Context, peer string, exclude
 		return fmt.Errorf("federation filter: checkout staging: %w", err)
 	}
 
-	// Delete excluded issues from the committed issues table.
-	deleted := false
+	// Guard each removed edge in the same staging transaction as its
+	// cascade. The filtered graph and its tokens are published together.
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("federation filter: begin staging transaction: %w", err)
+	}
+	defer tx.Rollback()
+	var excludedIDs []string
 	for _, excludeType := range excludeTypes {
-		var result interface{ RowsAffected() (int64, error) }
-		var execErr error
+		query, args := "SELECT id FROM issues WHERE issue_type = ?", []any{excludeType}
 		if excludeType == "wisp" {
-			result, execErr = conn.ExecContext(ctx, "DELETE FROM issues WHERE ephemeral = 1")
-		} else {
-			result, execErr = conn.ExecContext(ctx, "DELETE FROM issues WHERE issue_type = ?", excludeType)
+			query, args = "SELECT id FROM issues WHERE ephemeral = 1", nil
 		}
-		if execErr == nil {
-			if n, _ := result.RowsAffected(); n > 0 {
-				deleted = true
+		rows, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("federation filter: select excluded issues: %w", err)
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("federation filter: scan excluded issue: %w", err)
+			}
+			excludedIDs = append(excludedIDs, id)
+		}
+		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("federation filter: list excluded issues: %w", err)
+		}
+	}
+	if len(excludedIDs) > 0 {
+		if _, _, err := issueops.BumpRemovalCloseGuardsInTx(ctx, tx, excludedIDs, nil); err != nil {
+			return fmt.Errorf("federation filter: guard excluded issue edges: %w", err)
+		}
+		for _, excludeType := range excludeTypes {
+			query, args := "DELETE FROM issues WHERE issue_type = ?", []any{excludeType}
+			if excludeType == "wisp" {
+				query, args = "DELETE FROM issues WHERE ephemeral = 1", nil
+			}
+			if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+				return fmt.Errorf("federation filter: delete excluded issues: %w", err)
 			}
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("federation filter: commit staging transaction: %w", err)
+	}
 
-	if deleted {
+	if len(excludedIDs) > 0 {
 		if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', ?)",
 			"federation: exclude private issue types"); err != nil {
 			return fmt.Errorf("federation filter: commit filtered state: %w", err)

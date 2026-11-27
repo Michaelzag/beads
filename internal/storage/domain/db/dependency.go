@@ -10,6 +10,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -73,23 +74,34 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 
 	table := pickDepTable(opts.UseWispsTable)
 
-	var existingType string
+	var edgeID, existingType string
+	var targetIsIssue, targetIsWisp bool
+	var matches int
 	err := r.runner.QueryRowContext(ctx,
 		//nolint:gosec // G201: table and depTargetExpr are hardcoded constants
-		fmt.Sprintf("SELECT type FROM %s WHERE issue_id = ? AND %s = ?", table, depTargetExpr),
+		fmt.Sprintf("SELECT id, type, depends_on_issue_id IS NOT NULL, depends_on_wisp_id IS NOT NULL, COUNT(*) OVER () FROM %s WHERE issue_id = ? AND %s = ?", table, depTargetExpr),
 		dep.IssueID, dep.DependsOnID,
-	).Scan(&existingType)
+	).Scan(&edgeID, &existingType, &targetIsIssue, &targetIsWisp, &matches)
 	switch {
 	case err == nil:
+		if matches != 1 {
+			return fmt.Errorf("db: DependencySQLRepository.Insert: ambiguous dependency %s -> %s", dep.IssueID, dep.DependsOnID)
+		}
 		if existingType == string(dep.Type) {
 			//nolint:gosec // G201: table and depTargetExpr are hardcoded constants
 			if _, err := r.runner.ExecContext(ctx,
-				fmt.Sprintf("UPDATE %s SET metadata = ? WHERE issue_id = ? AND %s = ?", table, depTargetExpr),
-				metadata, dep.IssueID, dep.DependsOnID,
+				fmt.Sprintf("UPDATE %s SET metadata = ? WHERE id = ?", table),
+				metadata, edgeID,
 			); err != nil {
 				return fmt.Errorf("db: DependencySQLRepository.Insert: refresh metadata: %w", err)
 			}
-			return nil
+			kind := issueops.DepTargetExternal
+			if targetIsIssue {
+				kind = issueops.DepTargetIssue
+			} else if targetIsWisp {
+				kind = issueops.DepTargetWisp
+			}
+			return issueops.BumpEdgeCloseGuardsInTx(ctx, r.runner, dep.IssueID, dep.DependsOnID, opts.UseWispsTable, kind, dep.Type)
 		}
 		return fmt.Errorf("db: DependencySQLRepository.Insert: %s -> %s already exists with type %q (requested %q)",
 			dep.IssueID, dep.DependsOnID, existingType, dep.Type)
@@ -113,7 +125,14 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 	); err != nil {
 		return fmt.Errorf("db: DependencySQLRepository.Insert: %w", err)
 	}
-	return nil
+	kind := issueops.DepTargetIssue
+	switch targetCol {
+	case "depends_on_wisp_id":
+		kind = issueops.DepTargetWisp
+	case "depends_on_external":
+		kind = issueops.DepTargetExternal
+	}
+	return issueops.BumpEdgeCloseGuardsInTx(ctx, r.runner, dep.IssueID, dep.DependsOnID, opts.UseWispsTable, kind, dep.Type)
 }
 
 func (r *dependencySQLRepositoryImpl) HasCycle(ctx context.Context, issueID, dependsOnID string) (bool, error) {

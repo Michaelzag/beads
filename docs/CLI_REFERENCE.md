@@ -1444,6 +1444,11 @@ Update one or more issues.
 If no issue ID is provided, updates the last touched issue (from most recent
 create, update, show, or close operation).
 
+`--if-guard` compares the token from `bd show --json`. Dependency writes
+invalidate tokens for both issue endpoints. For example, deleting a parent
+invalidates each surviving child's prior token, so an update using that
+token is refused without writing.
+
 ```
 bd update [id...] [flags]
 ```

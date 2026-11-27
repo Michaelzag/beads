@@ -393,7 +393,7 @@ func AffectedByStatusChangeForWispInTx(ctx context.Context, tx *sql.Tx, id strin
 	return expandByParentChildDescendantsInTx(ctx, tx, issueSeed, wispSeed, issueSeen, wispSeen)
 }
 
-func AffectedByDepChangeInTx(ctx context.Context, tx *sql.Tx, source, target string, depType types.DependencyType) ([]string, []string, error) {
+func AffectedByDepChangeInTx(ctx context.Context, tx edgeQueryRunner, source, target string, depType types.DependencyType) ([]string, []string, error) {
 	switch depType {
 	case types.DepBlocks, types.DepConditionalBlocks, types.DepWaitsFor, types.DepParentChild:
 		issueSeed := []string{source}
@@ -411,7 +411,7 @@ func AffectedByDepChangeInTx(ctx context.Context, tx *sql.Tx, source, target str
 	}
 }
 
-func AffectedByDepChangeForWispInTx(ctx context.Context, tx *sql.Tx, source, target string, depType types.DependencyType) ([]string, []string, error) {
+func AffectedByDepChangeForWispInTx(ctx context.Context, tx edgeQueryRunner, source, target string, depType types.DependencyType) ([]string, []string, error) {
 	switch depType {
 	case types.DepBlocks, types.DepConditionalBlocks, types.DepWaitsFor, types.DepParentChild:
 		var issueSeed []string
@@ -466,6 +466,9 @@ func loadBlockingDependersForIDsInTx(
 			`, t.table, targetCol)
 			rows, err := tx.QueryContext(ctx, query, id)
 			if err != nil {
+				if optionalBlockedTable(t.table) && isTableNotExistError(err) {
+					continue
+				}
 				return fmt.Errorf("%s: query: %w", t.errCtx, err)
 			}
 			for rows.Next() {
@@ -550,7 +553,7 @@ func AffectedByDeletionInTx(
 }
 
 func expandByParentChildDescendantsInTx(
-	ctx context.Context, tx *sql.Tx,
+	ctx context.Context, tx edgeQueryRunner,
 	issueSeed, wispSeed []string,
 	issueSeen, wispSeen map[string]bool,
 ) ([]string, []string, error) {
@@ -595,7 +598,7 @@ func expandByParentChildDescendantsInTx(
 
 //nolint:gosec // G201: depTable and parentCol come from constant call sites.
 func appendChildrenInTx(
-	ctx context.Context, tx *sql.Tx,
+	ctx context.Context, tx edgeQueryRunner,
 	depTable, parentCol string,
 	parentIDs []string,
 	seen map[string]bool, queue *[]string,
@@ -611,6 +614,9 @@ func appendChildrenInTx(
 	for _, parentID := range parentIDs {
 		rows, err := tx.QueryContext(ctx, query, parentID)
 		if err != nil {
+			if optionalBlockedTable(depTable) && isTableNotExistError(err) {
+				return nil
+			}
 			return fmt.Errorf("expand children from %s on %s: %w", depTable, parentCol, err)
 		}
 		for rows.Next() {
@@ -684,7 +690,7 @@ func loadWaitersWhoseSpawnerIsParentOfInTx(
 }
 
 func loadWaitersOnSpawnerIDsInTx(
-	ctx context.Context, tx *sql.Tx,
+	ctx context.Context, tx edgeQueryRunner,
 	spawnerIDs []string,
 	issueSeed *[]string, issueSeen map[string]bool,
 	wispSeed *[]string, wispSeen map[string]bool,
@@ -697,7 +703,7 @@ func loadWaitersOnSpawnerIDsInTx(
 
 //nolint:gosec // G201: targetCol is one of two constant column names.
 func loadWaitersOnSpawnerIDsByColInTx(
-	ctx context.Context, tx *sql.Tx,
+	ctx context.Context, tx edgeQueryRunner,
 	targetCol string, spawnerIDs []string,
 	issueSeed *[]string, issueSeen map[string]bool,
 	wispSeed *[]string, wispSeen map[string]bool,
