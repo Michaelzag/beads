@@ -25,7 +25,7 @@ var releaseClaimCmd = &cobra.Command{
 	Use:          "release-claim ID --expected-assignee HOLDER --operation-id OP",
 	GroupID:      "issues",
 	Short:        "Release a tracker claim held by the expected assignee",
-	Long:         "Release a tracker claim held by the expected assignee. A durable refusal exits with code 3 and a JSON receipt.",
+	Long:         "Release a tracker claim held by the expected assignee. A refusal leaves the tracker unchanged and exits with code 3 and a JSON result.",
 	SilenceUsage: true,
 	Args: func(cmd *cobra.Command, args []string) error {
 		if err := cobra.ExactArgs(1)(cmd, args); err != nil {

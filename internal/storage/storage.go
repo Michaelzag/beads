@@ -31,8 +31,8 @@ const (
 	ReleaseClaimNotInProgress ReleaseClaimRefusalReason = "not_in_progress"
 )
 
-// ReleaseClaimRefusal is returned only after confirming an exact, durable
-// no-release receipt. Other errors do not prove the operation's outcome.
+// ReleaseClaimRefusal identifies a definitive no-release outcome, which does
+// not write a new receipt. Other errors do not prove the operation's outcome.
 type ReleaseClaimRefusal struct {
 	Reason ReleaseClaimRefusalReason
 }

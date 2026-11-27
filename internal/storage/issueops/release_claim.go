@@ -26,7 +26,7 @@ type releaseClaimReceipt struct {
 }
 
 // ReleaseClaimResult describes the operation's outcome within a transaction.
-// Recorded is false for replay; Updated is nonnil only for a new issue mutation.
+// Recorded is true only for a new success receipt; Updated describes its issue mutation.
 type ReleaseClaimResult struct {
 	Recorded      bool
 	Updated       *UpdateResult
@@ -34,7 +34,7 @@ type ReleaseClaimResult struct {
 }
 
 // ReleaseClaimInTx conditionally releases the expected claim and records its
-// outcome. Callers must commit before reporting a definitive refusal.
+// success. A new refusal leaves the transaction unchanged.
 func ReleaseClaimInTx(ctx context.Context, tx *sql.Tx, id, expectedAssignee, operationID, actor string) (ReleaseClaimResult, error) {
 	if id == "" || id != strings.TrimSpace(id) {
 		return ReleaseClaimResult{}, fmt.Errorf("release requires an exact issue ID")
@@ -81,9 +81,7 @@ func ReleaseClaimInTx(ctx context.Context, tx *sql.Tx, id, expectedAssignee, ope
 	}
 
 	if result.releaseRefusal != "" {
-		if err := BumpCloseGuardsInTx(ctx, tx, id); err != nil {
-			return ReleaseClaimResult{}, err
-		}
+		return ReleaseClaimResult{RefusalReason: result.releaseRefusal}, nil
 	}
 
 	// Never upsert. Distinct write IDs also prevent the Dolt merge from
@@ -92,9 +90,6 @@ func ReleaseClaimInTx(ctx context.Context, tx *sql.Tx, id, expectedAssignee, ope
 		"JSON_OBJECT('work_item_id', ?, 'expected_assignee', ?, 'operation_id', ?, 'refusal_reason', ?, 'write_id', UUID()))",
 		key, id, expectedAssignee, operationID, result.releaseRefusal); err != nil {
 		return ReleaseClaimResult{}, fmt.Errorf("insert release receipt: %w", err)
-	}
-	if result.releaseRefusal != "" {
-		return ReleaseClaimResult{Recorded: true, RefusalReason: result.releaseRefusal}, nil
 	}
 	return ReleaseClaimResult{Recorded: true, Updated: result}, nil
 }

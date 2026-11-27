@@ -46,8 +46,24 @@ func TestProtocol_ReleaseClaimReceipt(t *testing.T) {
 		t.Fatalf("assignee after refusals = %v, want %q", got, holder)
 	}
 
+	head := func() string {
+		cmd := exec.Command(w.bd, "vc", "status", "--json")
+		cmd.Dir, cmd.Env = w.dir, w.env()
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("read disposable workspace status: %v", err)
+		}
+		var status struct {
+			Commit string `json:"commit"`
+		}
+		if err := json.Unmarshal(out, &status); err != nil || status.Commit == "" || status.Commit == "(unknown)" {
+			t.Fatalf("cannot read Dolt HEAD: %s (%v)", out, err)
+		}
+		return status.Commit
+	}
 	assertRefusal := func(id, expectedAssignee, operationID, reason string) {
 		t.Helper()
+		before := head()
 		cmd := exec.Command(w.bd, "release-claim", id, "--expected-assignee", expectedAssignee, "--operation-id", operationID, "--json")
 		cmd.Dir = w.dir
 		cmd.Env = append(w.env(), "BD_JSON_ENVELOPE=1")
@@ -67,6 +83,9 @@ func TestProtocol_ReleaseClaimReceipt(t *testing.T) {
 		if err := json.Unmarshal(out, &got); err != nil || !maps.Equal(got, want) {
 			t.Fatalf("refusal receipt = %s (%v), want %v", out, err, want)
 		}
+		if after := head(); after != before {
+			t.Fatalf("refusal advanced Dolt HEAD: %s -> %s", before, after)
+		}
 	}
 	wrongHolder := "zagcode-attempt-" + strings.Repeat("c", 24)
 	refusedOp := "tracker-release:" + strings.Repeat("d", 64)
@@ -75,14 +94,13 @@ func TestProtocol_ReleaseClaimReceipt(t *testing.T) {
 		t.Fatalf("assignee after holder mismatch = %v, want %q", got, holder)
 	}
 
-	// Once recorded, the refusal must replay even if the predicate later matches.
+	// The same operation can release once the holder matches.
 	w.run("assign", id, wrongHolder)
-	assertRefusal(id, wrongHolder, refusedOp, "holder_changed")
-	issue := w.showJSON(id)
-	if issue["assignee"] != wrongHolder || issue["status"] != "in_progress" {
-		t.Fatalf("refusal replay changed the now-matching claim: %v", issue)
+	w.run("release-claim", id, "--expected-assignee", wrongHolder, "--operation-id", refusedOp)
+	if issue := w.showJSON(id); issue["status"] != "open" || (issue["assignee"] != nil && issue["assignee"] != "") {
+		t.Fatalf("retry did not release the now-matching claim: %v", issue)
 	}
-	w.run("assign", id, holder)
+	w.run("update", id, "--claim", "--actor", holder)
 
 	openID := w.create("Open issue with assignee", "--assignee", holder)
 	assertRefusal(openID, holder, "tracker-release:"+strings.Repeat("e", 64), "not_in_progress")
@@ -92,21 +110,6 @@ func TestProtocol_ReleaseClaimReceipt(t *testing.T) {
 		"work_item_id":      id,
 		"expected_assignee": holder,
 		"operation_id":      op,
-	}
-	head := func() string {
-		cmd := exec.Command(w.bd, "vc", "status", "--json")
-		cmd.Dir, cmd.Env = w.dir, w.env()
-		out, err := cmd.Output()
-		if err != nil {
-			t.Fatalf("read disposable workspace status: %v", err)
-		}
-		var status struct {
-			Commit string `json:"commit"`
-		}
-		if err := json.Unmarshal(out, &status); err != nil || status.Commit == "" || status.Commit == "(unknown)" {
-			t.Fatalf("cannot read Dolt HEAD: %s (%v)", out, err)
-		}
-		return status.Commit
 	}
 	cfg, err := configfile.Load(filepath.Join(w.dir, ".beads"))
 	if err != nil || cfg == nil || !cfg.IsDoltServerMode() || cfg.DoltDatabase == "" {

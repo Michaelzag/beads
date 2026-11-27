@@ -3,6 +3,7 @@ package dolt
 import (
 	"database/sql"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -205,7 +206,7 @@ func TestReleaseClaimConcurrentOperations(t *testing.T) {
 	}
 }
 
-func TestReleaseClaimRefusalIsImmutable(t *testing.T) {
+func TestReleaseClaimRefusalLeavesTrackerUnchanged(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 	ctx, cancel := testContext(t)
@@ -242,53 +243,57 @@ func TestReleaseClaimRefusalIsImmutable(t *testing.T) {
 				t.Fatalf("reassign issue: %v", err)
 			}
 
-			assertRefusal := func() {
-				t.Helper()
-				before, err := store.GetIssue(ctx, id)
-				if err != nil {
-					t.Fatalf("read issue before refusal: %v", err)
-				}
-				beforeEvents, err := store.GetEvents(ctx, id, 0)
-				if err != nil {
-					t.Fatalf("read audit before refusal: %v", err)
-				}
-				changed, err := store.ReleaseClaimWithResult(ctx, id, holder, op, actor)
-				var refusal *storage.ReleaseClaimRefusal
-				if changed || !errors.As(err, &refusal) || refusal.Reason != tc.reason {
-					t.Fatalf("release = (%v, %v); want durable refusal %s", changed, err, tc.reason)
-				}
-				after, err := store.GetIssue(ctx, id)
-				if err != nil {
-					t.Fatalf("read issue after refusal: %v", err)
-				}
-				if after.Status != before.Status || after.Assignee != before.Assignee || !after.UpdatedAt.Equal(before.UpdatedAt) {
-					t.Fatalf("refusal changed issue: before = %+v, after = %+v", before, after)
-				}
-				afterEvents, err := store.GetEvents(ctx, id, 0)
-				if err != nil || len(afterEvents) != len(beforeEvents) {
-					t.Fatalf("refusal changed audit: before = %d, after = %d, err = %v", len(beforeEvents), len(afterEvents), err)
-				}
+			before, err := store.GetIssue(ctx, id)
+			if err != nil {
+				t.Fatalf("read issue before refusal: %v", err)
 			}
-			assertRefusal()
-			var receipt string
-			if err := store.db.QueryRowContext(ctx, "SELECT value FROM metadata AS OF 'HEAD' WHERE `key` = ?",
-				"_release_claim_v1:"+op).Scan(&receipt); err != nil || !strings.Contains(receipt, string(tc.reason)) {
-				t.Fatalf("refusal receipt is not committed: %q, %v", receipt, err)
+			beforeEvents, err := store.GetEvents(ctx, id, 0)
+			if err != nil {
+				t.Fatalf("read audit before refusal: %v", err)
+			}
+			beforeCommit, err := store.GetCurrentCommit(ctx)
+			if err != nil {
+				t.Fatalf("read commit before refusal: %v", err)
+			}
+			changed, err := store.ReleaseClaimWithResult(ctx, id, holder, op, actor)
+			var refusal *storage.ReleaseClaimRefusal
+			if changed || !errors.As(err, &refusal) || refusal.Reason != tc.reason {
+				t.Fatalf("release = (%v, %v); want refusal %s", changed, err, tc.reason)
+			}
+			after, err := store.GetIssue(ctx, id)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Errorf("refusal changed issue: before = %+v, after = %+v, err = %v", before, after, err)
+			}
+			afterEvents, err := store.GetEvents(ctx, id, 0)
+			if err != nil || !reflect.DeepEqual(beforeEvents, afterEvents) {
+				t.Errorf("refusal changed audit: before = %+v, after = %+v, err = %v", beforeEvents, afterEvents, err)
+			}
+			if afterCommit, err := store.GetCurrentCommit(ctx); err != nil || afterCommit != beforeCommit {
+				t.Errorf("refusal changed Dolt HEAD: before = %s, after = %s, err = %v", beforeCommit, afterCommit, err)
+			}
+			var records int
+			if err := store.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM metadata WHERE `key` = ?",
+				"_release_claim_v1:"+op).Scan(&records); err != nil || records != 0 {
+				t.Errorf("refusal metadata rows = %d, err = %v; want 0", records, err)
 			}
 
-			// The same predicate now matches. A fresh operation ID could release
-			// this claim, but this operation must keep its original refusal.
+			// A refusal leaves the operation ID available if the predicate later matches.
 			if err := store.UpdateIssue(ctx, id, map[string]interface{}{
 				"assignee": holder,
 				"status":   types.StatusInProgress,
 			}, actor); err != nil {
 				t.Fatalf("restore matching claim: %v", err)
 			}
-			assertRefusal()
+			if changed, err := store.ReleaseClaimWithResult(ctx, id, holder, op, actor); err != nil || !changed {
+				t.Fatalf("retry of the same operation = (%v, %v); want new release", changed, err)
+			}
+			released, err := store.GetIssue(ctx, id)
+			if err != nil || released.Status != types.StatusOpen || released.Assignee != "" {
+				t.Fatalf("retry did not release issue: %+v, err = %v", released, err)
+			}
 
-			var refusal *storage.ReleaseClaimRefusal
 			if err := store.ReleaseClaim(ctx, id, successor, op, actor); err == nil || errors.As(err, &refusal) {
-				t.Fatalf("conflicting tuple exposed definitive refusal: %v", err)
+				t.Fatalf("successful retry did not bind the operation to its tuple: %v", err)
 			}
 		})
 	}
