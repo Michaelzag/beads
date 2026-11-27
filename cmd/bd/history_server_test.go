@@ -67,6 +67,9 @@ func TestServerHistory(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
+	var doltVersion string
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT DOLT_VERSION()").Scan(&doltVersion))
+	t.Logf("Dolt server version: %s", doltVersion)
 	execSQL := func(query string, args ...any) {
 		t.Helper()
 		_, err := db.ExecContext(ctx, query, args...)
@@ -149,6 +152,11 @@ func TestServerHistory(t *testing.T) {
 	t.Run("unlimited", func(t *testing.T) {
 		all, _ := run(bd, "history", id, "--json")
 		check(all, want)
+		var wire []map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(all, &wire))
+		for _, key := range []string{"CommitHash", "Committer", "CommitDate", "Issue"} {
+			require.Contains(t, wire[0], key, "history JSON field name changed")
+		}
 		limited, _ := run(bd, "history", id, "--limit", "2", "--json")
 		var allJSON, limitJSON []json.RawMessage
 		require.NoError(t, json.Unmarshal(all, &allJSON))
