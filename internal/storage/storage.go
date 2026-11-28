@@ -94,6 +94,20 @@ type GuardedIssueReader interface {
 	GetGuardedIssue(ctx context.Context, id string) (*GuardedIssue, error)
 }
 
+// ShowDetail is the guarded snapshot and counts used by JSON show.
+type ShowDetail struct {
+	GuardedIssue
+	DependentCount  int64
+	DependencyCount int64
+	CommentCount    int64
+}
+
+// ShowDetailReader batches exact local IDs for JSON show. An omitted input
+// must still go through normal resolution (including cross-repo routing).
+type ShowDetailReader interface {
+	GetShowDetails(ctx context.Context, inputs []string) (map[string]ShowDetail, error)
+}
+
 // CloseClaimIntent binds an operation to exactly one expected tracker state.
 type CloseClaimIntent struct {
 	WorkItemID                string `json:"work_item_id"`

@@ -129,6 +129,14 @@ func (h *HookFiringStore) GetGuardedIssue(ctx context.Context, id string) (*Guar
 	return store.GetGuardedIssue(ctx, id)
 }
 
+// GetShowDetails reads through to the inner store without firing hooks.
+func (h *HookFiringStore) GetShowDetails(ctx context.Context, inputs []string) (map[string]ShowDetail, error) {
+	if reader, ok := h.inner.(ShowDetailReader); ok {
+		return reader.GetShowDetails(ctx, inputs)
+	}
+	return nil, nil // The inner store only supports the per-ID read path.
+}
+
 // ReleaseClaim fires on_update only when a claim was newly released.
 func (h *HookFiringStore) ReleaseClaim(ctx context.Context, id, expectedAssignee, operationID, actor string) error {
 	_, err := h.ReleaseClaimWithResult(ctx, id, expectedAssignee, operationID, actor)

@@ -236,6 +236,17 @@ func (s *DoltStore) GetGuardedIssue(ctx context.Context, id string) (*storage.Gu
 	return result, err
 }
 
+// GetShowDetails loads exact local JSON show results in one read transaction.
+func (s *DoltStore) GetShowDetails(ctx context.Context, inputs []string) (map[string]storage.ShowDetail, error) {
+	var result map[string]storage.ShowDetail
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetShowDetailsInTx(ctx, tx, inputs)
+		return err
+	})
+	return result, err
+}
+
 // ClaimIssue atomically claims an issue using compare-and-swap semantics.
 // It sets the assignee to actor and status to "in_progress" only if the issue
 // currently has no assignee. Returns storage.ErrAlreadyClaimed if already claimed.

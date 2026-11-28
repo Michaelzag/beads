@@ -127,6 +127,17 @@ func (s *EmbeddedDoltStore) GetGuardedIssue(ctx context.Context, id string) (*st
 	return result, err
 }
 
+// GetShowDetails loads exact local JSON show results in one read transaction.
+func (s *EmbeddedDoltStore) GetShowDetails(ctx context.Context, inputs []string) (map[string]storage.ShowDetail, error) {
+	var result map[string]storage.ShowDetail
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetShowDetailsInTx(ctx, tx, inputs)
+		return err
+	})
+	return result, err
+}
+
 // ReopenIssue reopens a closed issue, setting status to open and clearing
 // closed_at and defer_until. If reason is non-empty, it is recorded as a comment.
 // Wraps UpdateIssue; EmbeddedDolt auto-commits the transaction.
