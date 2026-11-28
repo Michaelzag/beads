@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `bd history` can read an already-running Dolt SQL server with a SELECT-only account. It skips command-level maintenance while reading revisions.
+- `bd ready --parent` looks up descendants through dependency indexes and reuses the result for issues, wisps, and the text truncation count.
 
 ## [1.0.5] - 2026-05-28
 

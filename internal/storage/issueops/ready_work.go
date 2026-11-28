@@ -49,7 +49,7 @@ func buildReadyWorkOrder(policy types.SortPolicy) readyWorkOrder {
 	}
 }
 
-func buildReadyWorkPredicates(ctx context.Context, tx *sql.Tx, filter types.WorkFilter, tables FilterTables) (string, []any, error) {
+func buildReadyWorkPredicates(filter types.WorkFilter, tables FilterTables, descendantIDs []string) (string, []any, error) {
 	var statusClause string
 	if filter.Status != "" {
 		statusClause = "status = ?"
@@ -116,13 +116,8 @@ func buildReadyWorkPredicates(ctx context.Context, tx *sql.Tx, filter types.Work
 	// grandchildren were silently dropped despite the help text and
 	// WorkFilter.ParentID godoc both promising "descendants (recursive)".
 	if filter.ParentID != nil {
-		parentID := *filter.ParentID
-		descendantIDs, descErr := GetDescendantIDsInTx(ctx, tx, parentID, 0)
-		if descErr != nil {
-			return "", nil, fmt.Errorf("get parent descendants: %w", descErr)
-		}
 		parentClauses := []string{fmt.Sprintf("(id LIKE CONCAT(?, '.%%') AND id NOT IN (SELECT issue_id FROM %s WHERE type = 'parent-child'))", tables.Dependencies)}
-		args = append(args, parentID)
+		args = append(args, *filter.ParentID)
 		for start := 0; start < len(descendantIDs); start += queryBatchSize {
 			end := start + queryBatchSize
 			if end > len(descendantIDs) {
@@ -166,13 +161,51 @@ func buildReadyWorkPredicates(ctx context.Context, tx *sql.Tx, filter types.Work
 	return "WHERE " + strings.Join(whereClauses, " AND "), args, nil
 }
 
-//nolint:gosec // G201: whereSQL/orderBySQL built from hardcoded strings and ? placeholders
+func readyParentDescendantsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter) ([]string, error) {
+	if filter.ParentID == nil {
+		return nil, nil
+	}
+	ids, err := GetDescendantIDsInTx(ctx, tx, *filter.ParentID, 0)
+	if err != nil {
+		return nil, fmt.Errorf("get parent descendants: %w", err)
+	}
+	slices.Sort(ids)
+	return ids, nil
+}
+
 func GetReadyWorkInTx(
 	ctx context.Context,
 	tx *sql.Tx,
 	filter types.WorkFilter,
 ) ([]*types.Issue, error) {
-	issueIDs, err := queryReadyWorkCandidatesInTx(ctx, tx, filter, IssuesFilterTables)
+	descendantIDs, err := readyParentDescendantsInTx(ctx, tx, filter)
+	if err != nil {
+		return nil, err
+	}
+	return getReadyWorkWithDescendantsInTx(ctx, tx, filter, descendantIDs)
+}
+
+// GetReadyWorkWithTotalInTx reuses the same parent scope for the listing and
+// its optional truncation count. As before, the count is best-effort.
+func GetReadyWorkWithTotalInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter) ([]*types.Issue, int, error) {
+	descendantIDs, err := readyParentDescendantsInTx(ctx, tx, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	issues, err := getReadyWorkWithDescendantsInTx(ctx, tx, filter, descendantIDs)
+	total := len(issues)
+	if err == nil && filter.Limit > 0 && total == filter.Limit {
+		filter.Limit = 0
+		all, countErr := getReadyWorkWithDescendantsInTx(ctx, tx, filter, descendantIDs)
+		if countErr == nil && len(all) > total {
+			total = len(all)
+		}
+	}
+	return issues, total, err
+}
+
+func getReadyWorkWithDescendantsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter, descendantIDs []string) ([]*types.Issue, error) {
+	issueIDs, err := queryReadyWorkCandidatesInTx(ctx, tx, filter, IssuesFilterTables, descendantIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +225,7 @@ func GetReadyWorkInTx(
 		}
 	}
 
-	wisps, wErr := getReadyWispsInTx(ctx, tx, filter)
+	wisps, wErr := getReadyWispsInTx(ctx, tx, filter, descendantIDs)
 	if wErr != nil {
 		return nil, wErr
 	}
@@ -224,7 +257,7 @@ func mergeReadyWisps(ordered []*types.Issue, wisps []*types.Issue, filter types.
 	return ordered, nil
 }
 
-func getReadyWispsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter) ([]*types.Issue, error) {
+func getReadyWispsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter, descendantIDs []string) ([]*types.Issue, error) {
 	empty, err := wispsTableEmptyOrMissingInTx(ctx, tx)
 	if err != nil {
 		return nil, fmt.Errorf("search wisps (ready work): probe: %w", err)
@@ -243,7 +276,7 @@ func getReadyWispsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter)
 			}
 			return nil, fmt.Errorf("search wisps (ready work): %w", err)
 		}
-		return filterReadyWispsInTx(ctx, tx, filter, wisps)
+		return filterReadyWispsInTx(ctx, tx, filter, wisps, descendantIDs)
 	}
 
 	pageSize := readyWorkPageSize(filter.Limit)
@@ -265,7 +298,7 @@ func getReadyWispsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter)
 		if err != nil {
 			return nil, fmt.Errorf("search wisps (ready work): %w", err)
 		}
-		pageReady, err := filterReadyWispsInTx(ctx, tx, filter, pageWisps)
+		pageReady, err := filterReadyWispsInTx(ctx, tx, filter, pageWisps, descendantIDs)
 		if err != nil {
 			return nil, err
 		}
@@ -421,7 +454,7 @@ func readyWorkWispIssueFilter(filter types.WorkFilter) types.IssueFilter {
 	return wispFilter
 }
 
-func filterReadyWispsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter, wisps []*types.Issue) ([]*types.Issue, error) {
+func filterReadyWispsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter, wisps []*types.Issue, descendantIDs []string) ([]*types.Issue, error) {
 	if len(wisps) == 0 {
 		return wisps, nil
 	}
@@ -434,20 +467,12 @@ func filterReadyWispsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilt
 	excluded := make(map[string]struct{})
 	if filter.ParentID != nil {
 		parentID := *filter.ParentID
-		descendantIDs, err := GetDescendantIDsInTx(ctx, tx, parentID, 0)
-		if err != nil {
-			return nil, fmt.Errorf("get wisp parent descendants: %w", err)
-		}
-		descendantSet := make(map[string]struct{}, len(descendantIDs))
-		for _, id := range descendantIDs {
-			descendantSet[id] = struct{}{}
-		}
 		parentedSet, err := getParentedIDSetInTx(ctx, tx, wispIDs)
 		if err != nil {
 			return nil, err
 		}
 		for _, wisp := range wisps {
-			if _, ok := descendantSet[wisp.ID]; ok {
+			if _, ok := slices.BinarySearch(descendantIDs, wisp.ID); ok {
 				continue
 			}
 			if strings.HasPrefix(wisp.ID, parentID+".") {
@@ -557,8 +582,8 @@ func issueCreatedBefore(a, b *types.Issue) bool {
 	return a.ID < b.ID
 }
 
-func queryReadyWorkCandidatesInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter, tables FilterTables) ([]string, error) {
-	where, args, err := buildReadyWorkPredicates(ctx, tx, filter, tables)
+func queryReadyWorkCandidatesInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter, tables FilterTables, descendantIDs []string) ([]string, error) {
+	where, args, err := buildReadyWorkPredicates(filter, tables, descendantIDs)
 	if err != nil {
 		return nil, err
 	}

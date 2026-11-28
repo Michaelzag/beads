@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -163,6 +164,12 @@ func GetDescendantIDsInTx(ctx context.Context, tx *sql.Tx, rootID string, maxDep
 	if rootID == "" {
 		return nil, nil
 	}
+	if maxDepth <= 0 {
+		return getDescendantIDsByLevelInTx(ctx, tx, rootID)
+	}
+
+	// A bounded walk errors if any path reaches the limit, not just the
+	// shortest path to each node. Keep the path-sensitive traversal for it.
 
 	queryDescendants := func(includeWisps bool) ([]string, bool, error) {
 		edgeQuery := fmt.Sprintf(`
@@ -234,6 +241,69 @@ func GetDescendantIDsInTx(ctx context.Context, tx *sql.Tx, rootID string, maxDep
 		return nil, fmt.Errorf("parent descendant traversal for %s reached max depth %d", rootID, maxDepth)
 	}
 	return result, nil
+}
+
+func getDescendantIDsByLevelInTx(ctx context.Context, tx *sql.Tx, rootID string) ([]string, error) {
+	seen := map[string]struct{}{rootID: {}}
+	frontier := []string{rootID}
+	tables := []string{"dependencies", "wisp_dependencies"}
+	var result []string
+	for len(frontier) > 0 {
+		var next []string
+		for batch := range slices.Chunk(frontier, queryBatchSize) {
+			for _, table := range tables {
+				for _, target := range descendantTargetColumns {
+					query, args := descendantChildrenQuery(table, target, batch, rootID)
+					rows, err := tx.QueryContext(ctx, query, args...)
+					if err != nil {
+						if optionalBlockedTable(table) && isTableNotExistError(err) {
+							tables = tables[:1]
+							break
+						}
+						return nil, err
+					}
+					for rows.Next() {
+						var id string
+						if err := rows.Scan(&id); err != nil {
+							_ = rows.Close()
+							return nil, fmt.Errorf("scan descendant: %w", err)
+						}
+						if _, visited := seen[id]; !visited {
+							seen[id] = struct{}{}
+							next = append(next, id)
+						}
+					}
+					_ = rows.Close()
+					if err := rows.Err(); err != nil {
+						return nil, fmt.Errorf("descendant rows: %w", err)
+					}
+				}
+			}
+		}
+		result = append(result, next...)
+		frontier = next
+	}
+	return result, nil
+}
+
+var descendantTargetColumns = [...]string{"depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"}
+
+// Each edge has exactly one target column. Keep the target lookups in
+// separate statements: Dolt can fall back to scanning inside a UNION, and
+// IN can compare with the session collation instead of the column's.
+// OR-ed equalities retain the column collation and use (type, target) ranges.
+//
+//nolint:gosec // G201: only hardcoded table/column names and placeholders.
+func descendantChildrenQuery(table, target string, frontier []string, rootID string) (string, []any) {
+	eq := target + " = ?"
+	predicate := eq + strings.Repeat(" OR "+eq, len(frontier)-1)
+	args := make([]any, 0, len(frontier)+1)
+	for _, id := range frontier {
+		args = append(args, id)
+	}
+	args = append(args, rootID)
+	// Use the database's ID collation to exclude even a root alias.
+	return fmt.Sprintf("SELECT issue_id FROM %s WHERE type = 'parent-child' AND (%s) AND issue_id <> ?", table, predicate), args
 }
 
 //nolint:gosec // G201: tables are hardcoded
