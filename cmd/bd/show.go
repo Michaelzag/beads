@@ -1,10 +1,12 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -116,7 +118,28 @@ var showCmd = &cobra.Command{
 		// Direct mode - use routed resolution for cross-repo lookups
 		allDetails := []interface{}{}
 		foundCount := 0
+		var batched map[string]storage.ShowDetail
+		if jsonOutput && len(args) > 1 && !shortMode && !includeDepends && !includeComments {
+			if reader, ok := store.(storage.ShowDetailReader); ok {
+				// Keep the original per-ID diagnostics if a batch read fails.
+				if details, err := reader.GetShowDetails(ctx, args); err == nil {
+					batched = details
+				}
+			}
+		}
 		for idx, id := range args {
+			if d, ok := batched[id]; ok && d.Issue != nil {
+				details := &types.IssueDetails{
+					Issue:           *d.Issue,
+					Labels:          d.Issue.Labels,
+					Dependencies:    d.Dependencies,
+					DependentCount:  &d.DependentCount,
+					DependencyCount: &d.DependencyCount,
+					CommentCount:    &d.CommentCount,
+				}
+				allDetails = append(allDetails, newShowIssueJSON(details, d.GuardToken))
+				continue
+			}
 			// Resolve and get issue with routing (e.g., gt-xyz routes to another rig)
 			result, err := resolveAndGetIssueWithRouting(ctx, store, id)
 			if err != nil {
@@ -153,10 +176,6 @@ var showCmd = &cobra.Command{
 					FatalErrorRespectJSON("reading %s: %v", id, err)
 				}
 				issue = snap.Issue
-				var guardToken *string
-				if snap.GuardToken != "" {
-					guardToken = &snap.GuardToken
-				}
 				// be-ijck6q: default is count-only (no dependents/comments slice in output).
 				// Use --include-dependents / --include-comments to stream the full lists.
 				details := &types.IssueDetails{Issue: *issue}
@@ -226,14 +245,7 @@ var showCmd = &cobra.Command{
 					}
 				}
 
-				// Compute parent from dependencies.
-				for _, dep := range details.Dependencies {
-					if dep.DependencyType == types.DepParentChild {
-						details.Parent = &dep.ID
-						break
-					}
-				}
-				allDetails = append(allDetails, &showIssueJSON{IssueDetails: details, GuardToken: guardToken})
+				allDetails = append(allDetails, newShowIssueJSON(details, snap.GuardToken))
 				result.Close()
 				continue
 			}
@@ -451,6 +463,25 @@ var showCmd = &cobra.Command{
 type showIssueJSON struct {
 	*types.IssueDetails
 	GuardToken *string `json:"guard_token"`
+}
+
+func newShowIssueJSON(details *types.IssueDetails, token string) *showIssueJSON {
+	for _, dep := range details.Dependencies {
+		if dep.DependencyType == types.DepParentChild {
+			details.Parent = &dep.ID
+			break
+		}
+	}
+	// Dolt's dependency scans do not guarantee an order. Use the same
+	// deterministic JSON order for both routed and batched results.
+	slices.SortFunc(details.Dependencies, func(a, b *types.IssueWithDependencyMetadata) int {
+		return cmp.Or(cmp.Compare(a.DependencyType, b.DependencyType), cmp.Compare(a.ID, b.ID))
+	})
+	result := &showIssueJSON{IssueDetails: details}
+	if token != "" {
+		result.GuardToken = &token
+	}
+	return result
 }
 
 // readGuardedIssue reads the issue (routed as update --if-guard routes), its
