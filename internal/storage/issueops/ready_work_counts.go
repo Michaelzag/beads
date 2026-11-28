@@ -17,7 +17,11 @@ func GetReadyWorkWithCountsInTx(ctx context.Context, tx *sql.Tx, filter types.Wo
 		return nil, fmt.Errorf("get ready work with counts: wisp dependency probe: %w", err)
 	}
 
-	issueIDs, err := queryReadyWorkCandidatesInTx(ctx, tx, filter, IssuesFilterTables)
+	descendantIDs, err := readyParentDescendantsInTx(ctx, tx, filter)
+	if err != nil {
+		return nil, err
+	}
+	issueIDs, err := queryReadyWorkCandidatesInTx(ctx, tx, filter, IssuesFilterTables, descendantIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -37,7 +41,7 @@ func GetReadyWorkWithCountsInTx(ctx context.Context, tx *sql.Tx, filter types.Wo
 		return out, nil
 	}
 
-	wispIDs, err := queryReadyWorkCandidatesInTx(ctx, tx, filter, WispsFilterTables)
+	wispIDs, err := queryReadyWorkCandidatesInTx(ctx, tx, filter, WispsFilterTables, descendantIDs)
 	if err != nil {
 		if isTableNotExistError(err) {
 			return out, nil

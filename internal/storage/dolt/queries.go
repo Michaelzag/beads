@@ -41,6 +41,17 @@ func (s *DoltStore) GetReadyWork(ctx context.Context, filter types.WorkFilter) (
 	return result, err
 }
 
+func (s *DoltStore) GetReadyWorkWithTotal(ctx context.Context, filter types.WorkFilter) ([]*types.Issue, int, error) {
+	var result []*types.Issue
+	var total int
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, total, err = issueops.GetReadyWorkWithTotalInTx(ctx, tx, filter)
+		return err
+	})
+	return result, total, err
+}
+
 func (s *DoltStore) GetReadyWorkWithCounts(ctx context.Context, filter types.WorkFilter) ([]*types.IssueWithCounts, error) {
 	var result []*types.IssueWithCounts
 	err := s.withReadTx(ctx, func(tx *sql.Tx) error {

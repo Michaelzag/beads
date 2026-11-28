@@ -230,21 +230,9 @@ This is useful for agents executing molecules to see which steps can run next.`,
 			return
 		}
 
-		issues, err := activeStore.GetReadyWork(ctx, filter)
+		issues, totalReady, err := readyWorkForDisplay(ctx, activeStore, filter)
 		if err != nil {
 			FatalError("%v", err)
-		}
-
-		totalReady := len(issues)
-		truncated := false
-		if !jsonOutput && filter.Limit > 0 && len(issues) == filter.Limit {
-			countFilter := filter
-			countFilter.Limit = 0
-			allIssues, countErr := activeStore.GetReadyWork(ctx, countFilter)
-			if countErr == nil && len(allIssues) > len(issues) {
-				totalReady = len(allIssues)
-				truncated = true
-			}
 		}
 		// Show upgrade notification if needed
 		maybeShowUpgradeNotification()
@@ -290,7 +278,7 @@ This is useful for agents executing molecules to see which steps can run next.`,
 		}
 
 		// Show truncation footer if results were limited
-		if truncated {
+		if totalReady > len(issues) {
 			fmt.Printf("%s\n\n", ui.RenderMuted(fmt.Sprintf("Showing %d of %d ready issues. Use -n to show more.", len(issues), totalReady)))
 		}
 
@@ -298,6 +286,27 @@ This is useful for agents executing molecules to see which steps can run next.`,
 		maybeShowTip(store)
 	},
 }
+
+func readyWorkForDisplay(ctx context.Context, store storage.DoltStorage, filter types.WorkFilter) ([]*types.Issue, int, error) {
+	// The Dolt stores can share a single parent traversal between the
+	// limited listing and the optional truncation count.
+	if scoped, ok := storage.UnwrapStore(store).(interface {
+		GetReadyWorkWithTotal(context.Context, types.WorkFilter) ([]*types.Issue, int, error)
+	}); ok && filter.ParentID != nil && filter.Limit > 0 {
+		return scoped.GetReadyWorkWithTotal(ctx, filter)
+	}
+	issues, err := store.GetReadyWork(ctx, filter)
+	total := len(issues)
+	if err == nil && filter.Limit > 0 && total == filter.Limit {
+		filter.Limit = 0
+		all, countErr := store.GetReadyWork(ctx, filter)
+		if countErr == nil && len(all) > total {
+			total = len(all)
+		}
+	}
+	return issues, total, err
+}
+
 var blockedCmd = &cobra.Command{
 	Use:   "blocked",
 	Short: "Show blocked issues",

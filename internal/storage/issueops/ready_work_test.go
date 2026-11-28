@@ -117,6 +117,29 @@ func TestGetReadyWorkInTx_PropagatesDeferredParentChildError(t *testing.T) {
 	}
 }
 
+func TestReadyParentWalkOnceWithCounts(t *testing.T) {
+	t.Parallel()
+	_, mock, tx := beginMockTx(t)
+	const root = "ready-root"
+	parent := root
+	mock.ExpectQuery(`SELECT 1 FROM wisp_dependencies LIMIT 1`).WillReturnRows(sqlmock.NewRows([]string{"1"}))
+	for _, table := range []string{"dependencies", "wisp_dependencies"} {
+		for _, target := range descendantTargetColumns {
+			mock.ExpectQuery(`SELECT issue_id FROM ` + table + ` WHERE type = 'parent-child' AND \(` + target + ` = \?\)`).
+				WithArgs(root, root).WillReturnRows(sqlmock.NewRows([]string{"issue_id"}))
+		}
+	}
+	mock.ExpectQuery(`SELECT i\.id FROM issues i`).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectQuery(`SELECT 1 FROM wisps LIMIT 1`).WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+	mock.ExpectQuery(`SELECT i\.id FROM wisps i`).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	if _, err := GetReadyWorkWithCountsInTx(context.Background(), tx, types.WorkFilter{ParentID: &parent}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLoadStatusByIDInTxErrorsOnIssueWispCollision(t *testing.T) {
 	t.Parallel()
 
