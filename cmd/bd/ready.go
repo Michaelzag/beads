@@ -223,24 +223,10 @@ This is useful for agents executing molecules to see which steps can run next.`,
 			if err != nil {
 				FatalError("%v", err)
 			}
-			totalReady := len(results)
-			truncated := false
-			if filter.Limit > 0 && len(results) == filter.Limit {
-				countFilter := filter
-				countFilter.Limit = 0
-				all, countErr := activeStore.GetReadyWorkWithCounts(ctx, countFilter)
-				if countErr == nil && len(all) > len(results) {
-					totalReady = len(all)
-					truncated = true
-				}
-			}
 			if results == nil {
 				results = []*types.IssueWithCounts{}
 			}
 			outputJSON(results)
-			if truncated {
-				fmt.Fprintf(os.Stderr, "Showing %d of %d ready issues. Use --limit 0 for all, or --limit N to raise the cap.\n", len(results), totalReady)
-			}
 			return
 		}
 

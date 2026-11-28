@@ -87,7 +87,7 @@ func TestEmbeddedReady(t *testing.T) {
 		}
 	})
 
-	t.Run("ready_json_truncation_hint", func(t *testing.T) {
+	t.Run("ready_json_respects_limit_without_truncation_hint", func(t *testing.T) {
 		for i := 0; i < 3; i++ {
 			bdCreate(t, bd, dir, fmt.Sprintf("Ready capped issue %d", i), "--type", "task")
 		}
@@ -101,11 +101,15 @@ func TestEmbeddedReady(t *testing.T) {
 		if err != nil {
 			t.Fatalf("bd ready --json --limit 2 failed: %v\nstderr: %s\nstdout: %s", err, stderr.String(), out)
 		}
-		if !json.Valid(bytes.TrimSpace(out)) {
-			t.Fatalf("ready JSON stdout should remain parseable, got: %s", out)
+		var issues []types.IssueWithCounts
+		if err := json.Unmarshal(out, &issues); err != nil {
+			t.Fatalf("parse ready JSON: %v\n%s", err, out)
 		}
-		if !strings.Contains(stderr.String(), "Use --limit 0 for all") {
-			t.Fatalf("expected truncation hint on stderr, got: %q", stderr.String())
+		if len(issues) != 2 {
+			t.Fatalf("ready returned %d issues, want the limit of 2", len(issues))
+		}
+		if strings.Contains(stderr.String(), "Use --limit 0 for all") {
+			t.Fatalf("unexpected truncation hint on stderr: %q", stderr.String())
 		}
 	})
 
