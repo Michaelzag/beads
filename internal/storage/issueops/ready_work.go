@@ -466,7 +466,7 @@ func filterReadyWispsInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilt
 				excluded[wisp.ID] = struct{}{}
 			}
 		}
-		deferredChildIDs, err := getChildrenOfDeferredParentsInTx(ctx, tx, wispIDs)
+		deferredChildIDs, err := getChildrenOfDeferredParentsInTx(ctx, tx, "wisps", wispIDs)
 		if err != nil {
 			return nil, fmt.Errorf("get ready work: compute deferred parent children: %w", err)
 		}
@@ -590,7 +590,7 @@ func queryIssueCandidatesInTx(ctx context.Context, tx *sql.Tx, tables FilterTabl
 		if err != nil {
 			return nil, err
 		}
-		deferred, err := getChildrenOfDeferredParentsInTx(ctx, tx, page)
+		deferred, err := getChildrenOfDeferredParentsInTx(ctx, tx, tables.Main, page)
 		if err != nil {
 			return nil, fmt.Errorf("get ready work: compute deferred parent children: %w", err)
 		}
@@ -632,39 +632,20 @@ func queryReadyIssueIDPage(ctx context.Context, tx *sql.Tx, query string, args [
 
 // getChildrenOfDeferredParentsInTx checks only the supplied candidate IDs,
 // preserving both dependency sources and both parent target types.
-func getChildrenOfDeferredParentsInTx(ctx context.Context, tx *sql.Tx, candidateIDs []string) (map[string]struct{}, error) {
+func getChildrenOfDeferredParentsInTx(ctx context.Context, tx *sql.Tx, candidateTable string, candidateIDs []string) (map[string]struct{}, error) {
 	deferred := make(map[string]struct{})
 	for batch := range slices.Chunk(candidateIDs, queryBatchSize) {
-		issueParents, wispParents := make(map[string][]string), make(map[string][]string)
 		for _, depTable := range []string{"dependencies", "wisp_dependencies"} {
-			if err := loadCandidateParentsInTx(ctx, tx, depTable, batch, issueParents, wispParents); err != nil {
-				if depTable == "wisp_dependencies" && isTableNotExistError(err) {
-					continue
-				}
-				return nil, fmt.Errorf("deferred parents: candidate edges from %s: %w", depTable, err)
-			}
-		}
-		for _, source := range []struct {
-			table    string
-			children map[string][]string
-		}{{"issues", issueParents}, {"wisps", wispParents}} {
-			parentIDs := make([]string, 0, len(source.children))
-			for parent := range source.children {
-				parentIDs = append(parentIDs, parent)
-			}
-			for parents := range slices.Chunk(parentIDs, queryBatchSize) {
-				query, args := futureDeferredParentsQuery(source.table, parents)
-				ids, err := queryReadyIssueIDPage(ctx, tx, query, args)
-				if err != nil {
-					if source.table == "wisps" && isTableNotExistError(err) {
+			for _, parentTable := range []string{"issues", "wisps"} {
+				query, args := deferredParentChildrenQuery(candidateTable, depTable, parentTable, batch)
+				if err := collectDeferredChildrenInTx(ctx, tx, query, args, deferred); err != nil {
+					if depTable == "wisp_dependencies" && isTableNotExistError(err) {
 						break
 					}
-					return nil, fmt.Errorf("deferred parents: lookup in %s: %w", source.table, err)
-				}
-				for _, parent := range ids {
-					for _, child := range source.children[parent] {
-						deferred[child] = struct{}{}
+					if parentTable == "wisps" && isTableNotExistError(err) {
+						continue
 					}
+					return nil, fmt.Errorf("deferred parents: lookup in %s/%s: %w", depTable, parentTable, err)
 				}
 			}
 		}
@@ -672,8 +653,7 @@ func getChildrenOfDeferredParentsInTx(ctx context.Context, tx *sql.Tx, candidate
 	return deferred, nil
 }
 
-func loadCandidateParentsInTx(ctx context.Context, tx *sql.Tx, table string, ids []string, issueParents, wispParents map[string][]string) error {
-	query, args := candidateParentEdgesQuery(table, ids)
+func collectDeferredChildrenInTx(ctx context.Context, tx *sql.Tx, query string, args []any, deferred map[string]struct{}) error {
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
@@ -681,34 +661,35 @@ func loadCandidateParentsInTx(ctx context.Context, tx *sql.Tx, table string, ids
 	defer rows.Close()
 	for rows.Next() {
 		var child string
-		var issueParent, wispParent sql.NullString
-		if err := rows.Scan(&child, &issueParent, &wispParent); err != nil {
+		var parent sql.NullString
+		if err := rows.Scan(&child, &parent); err != nil {
 			return err
 		}
-		if issueParent.Valid {
-			issueParents[issueParent.String] = append(issueParents[issueParent.String], child)
-		}
-		if wispParent.Valid {
-			wispParents[wispParent.String] = append(wispParents[wispParent.String], child)
+		if parent.Valid {
+			deferred[child] = struct{}{}
 		}
 	}
 	return rows.Err()
 }
 
-//nolint:gosec // G201: names are fixed and IDs are bound.
-func candidateParentEdgesQuery(table string, ids []string) (string, []any) {
-	placeholders, args := buildSQLInClause(ids)
-	return fmt.Sprintf(`SELECT issue_id, depends_on_issue_id, depends_on_wisp_id FROM %s
-		WHERE issue_id IN (%s) AND type = 'parent-child'`, table, placeholders), args
-}
-
-// Keep the parent lookup separate so Dolt cannot reorder a join into an
-// unindexed scan of future-deferred parents.
+// Use SQL equality for both IDs so legacy collations can match aliases. Keep
+// the deferred check on the outer join: filtering out NULLs in SQL can let
+// Dolt reorder from the parents and scan their unindexed defer_until column.
 //
 //nolint:gosec // G201: names are fixed and IDs are bound.
-func futureDeferredParentsQuery(table string, ids []string) (string, []any) {
+func deferredParentChildrenQuery(candidateTable, depTable, parentTable string, ids []string) (string, []any) {
+	targetCol := "depends_on_issue_id"
+	if parentTable == "wisps" {
+		targetCol = "depends_on_wisp_id"
+	}
 	placeholders, args := buildSQLInClause(ids)
-	return fmt.Sprintf(`SELECT id FROM %s WHERE id IN (%s) AND defer_until > UTC_TIMESTAMP()`, table, placeholders), args
+	return fmt.Sprintf(`
+		SELECT /*+ LOOKUP_JOIN(i,dep) LOOKUP_JOIN(dep,p) */ i.id, p.id
+		FROM %s i
+		LEFT JOIN %s dep ON dep.issue_id = i.id
+		LEFT JOIN %s p ON p.id = dep.%s AND dep.type = 'parent-child' AND p.defer_until > UTC_TIMESTAMP()
+		WHERE i.id IN (%s)
+	`, candidateTable, depTable, parentTable, targetCol, placeholders), args
 }
 
 //nolint:gosec // G201: depTable is hardcoded to "dependencies" or "wisp_dependencies"

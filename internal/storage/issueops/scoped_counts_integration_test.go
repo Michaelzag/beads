@@ -38,7 +38,7 @@ func TestScopedIssueCountsOnDolt(t *testing.T) {
 	defer admin.Close()
 	ctx := context.Background()
 	database := fmt.Sprintf("bd_scoped_counts_%d", time.Now().UnixNano())
-	if _, err := admin.ExecContext(ctx, "CREATE DATABASE "+database); err != nil {
+	if _, err := admin.ExecContext(ctx, "CREATE DATABASE "+database+" CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"); err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
@@ -81,7 +81,7 @@ func TestScopedIssueCountsOnDolt(t *testing.T) {
 		exec(`INSERT INTO comments (issue_id,author,text) VALUES (?, 'fixture', 'comment')`, id)
 	}
 	exec(`INSERT INTO dependencies (id,issue_id,type,depends_on_issue_id,created_by) VALUES
-		('z-hold','hyd-root.01','parent-child','hyd-hold','fixture'),
+		('z-hold','hyd-ROOT.01','parent-child','hyd-HOLD','fixture'),
 		('a-block','hyd-root.02','blocks','hyd-linked','fixture'),
 		('z-reverse','hyd-linked','blocks','hyd-root.02','fixture')`)
 	// Explicitly use the production query builders in the scale check. TREE
@@ -90,7 +90,7 @@ func TestScopedIssueCountsOnDolt(t *testing.T) {
 	checkPlans := func(tx *sql.Tx) []int {
 		t.Helper()
 		var accesses []int
-		check := func(query string, args []any) {
+		check := func(query string, args []any, deferred bool) {
 			t.Helper()
 			rows, err := tx.QueryContext(ctx, "EXPLAIN FORMAT=TREE "+query, args...)
 			if err != nil {
@@ -112,17 +112,22 @@ func TestScopedIssueCountsOnDolt(t *testing.T) {
 			if strings.Contains(plan, "─ Table\n") || strings.Contains(plan, "TableScan") || !strings.Contains(plan, "IndexedTableAccess(") {
 				t.Fatalf("expected only indexed table reads, got:\n%s", plan)
 			}
+			if deferred && (!strings.Contains(plan, "keys: i.id") || !strings.Contains(plan, "keys: dep.depends_on_")) {
+				t.Fatalf("deferred parent must be looked up via candidate edge keys, got:\n%s", plan)
+			}
 			accesses = append(accesses, strings.Count(plan, "IndexedTableAccess("))
 		}
 		for _, tables := range []FilterTables{IssuesFilterTables, WispsFilterTables} {
 			q, args := issueCountsQuery(tables, childIDs, true, false)
-			check(q, args)
+			check(q, args, false)
 		}
 		for _, tables := range []FilterTables{IssuesFilterTables, WispsFilterTables} {
-			q, args := candidateParentEdgesQuery(tables.Dependencies, childIDs)
-			check(q, args)
-			q, args = futureDeferredParentsQuery(tables.Main, []string{parent, "hyd-hold"})
-			check(q, args)
+			for _, deps := range []string{"dependencies", "wisp_dependencies"} {
+				for _, parents := range []string{"issues", "wisps"} {
+					q, args := deferredParentChildrenQuery(tables.Main, deps, parents, childIDs)
+					check(q, args, true)
+				}
+			}
 		}
 		return accesses
 	}
