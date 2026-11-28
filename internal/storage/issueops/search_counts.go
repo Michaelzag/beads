@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"sort"
+	"strings"
 
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -86,38 +88,73 @@ func runFilterSearchQueryInTx(ctx context.Context, tx *sql.Tx, query string, fil
 	if len(whereClauses) > 0 {
 		whereSQL = "WHERE " + joinAnd(whereClauses)
 	}
-	limitSQL := ""
-	if filter.Limit > 0 {
-		limitSQL = fmt.Sprintf("LIMIT %d", filter.Limit)
-	}
 	const orderBy = "ORDER BY i.priority ASC, i.created_at DESC, i.id ASC"
-	return runSearchQueryInTx(ctx, tx, tables, whereSQL, orderBy, limitSQL, args, includeWispReverseDeps, filter.SkipLabels)
+	ids, err := queryIssueCandidatesInTx(ctx, tx, tables, whereSQL, orderBy, args, filter.Limit, false)
+	if err != nil {
+		return nil, err
+	}
+	return hydrateIssueCountsInTx(ctx, tx, tables, ids, includeWispReverseDeps, filter.SkipLabels)
 }
 
-//nolint:gosec // G201: SQL fragments are caller-built from hardcoded shapes
-func runSearchQueryInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, whereSQL, orderBySQL, limitSQL string, args []interface{}, includeWispReverseDeps bool, skipLabels bool) ([]*types.IssueWithCounts, error) {
-	reverseBlockerSelect := `
-				SELECT COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) AS dep_id
-				FROM dependencies WHERE type = 'blocks'
-	`
-	if includeWispReverseDeps {
-		reverseBlockerSelect += `
-				UNION ALL
-				SELECT COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) AS dep_id
-				FROM wisp_dependencies WHERE type = 'blocks'
-		`
+func hydrateIssueCountsInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, ids []string, includeWispReverseDeps, skipLabels bool) ([]*types.IssueWithCounts, error) {
+	var out []*types.IssueWithCounts
+	for batch := range slices.Chunk(ids, queryBatchSize) {
+		query, args := issueCountsQuery(tables, batch, includeWispReverseDeps, skipLabels)
+		items, err := scanIssueCountsInTx(ctx, tx, tables, query, args)
+		if err != nil {
+			return nil, err
+		}
+		byID := make(map[string]*types.IssueWithCounts, len(items))
+		for _, item := range items {
+			byID[item.Issue.ID] = item
+		}
+		for _, id := range batch {
+			if item := byID[id]; item != nil {
+				out = append(out, item)
+			}
+		}
+	}
+	return out, nil
+}
+
+//nolint:gosec // G201: SQL fragments use only fixed names and placeholders.
+func issueCountsQuery(tables FilterTables, ids []string, includeWispReverseDeps, skipLabels bool) (string, []any) {
+	placeholders, batchArgs := buildSQLInClause(ids)
+	var args []any
+	scope := func(column string) string {
+		args = append(args, batchArgs...)
+		return column + " IN (" + placeholders + ")"
 	}
 
 	labelsSelect := "l.labels_json AS labels_json"
 	labelsJoin := fmt.Sprintf(`
 		LEFT JOIN (
 			SELECT issue_id, JSON_ARRAYAGG(label) AS labels_json
-			FROM %s
+			FROM %s WHERE %s
 			GROUP BY issue_id
-		) l ON l.issue_id = i.id`, tables.Labels)
+		) l ON l.issue_id = i.id`, tables.Labels, scope("issue_id"))
 	if skipLabels {
 		labelsSelect = "NULL AS labels_json"
 		labelsJoin = ""
+		args = nil
+	}
+
+	dependencyCountScope := scope("issue_id")
+	// Split COALESCE into indexed target lookups. The null guards preserve its
+	// precedence, including for pre-existing rows with multiple targets set.
+	var reverseBlockers []string
+	depTables := []string{"dependencies"}
+	if includeWispReverseDeps {
+		depTables = append(depTables, "wisp_dependencies")
+	}
+	for _, table := range depTables {
+		nullGuards := ""
+		for _, col := range []string{"depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"} {
+			reverseBlockers = append(reverseBlockers, fmt.Sprintf(
+				"SELECT %s AS dep_id FROM %s WHERE type = 'blocks' AND %s%s",
+				col, table, scope(col), nullGuards))
+			nullGuards += " AND " + col + " IS NULL"
+		}
 	}
 
 	searchSQL := fmt.Sprintf(`
@@ -133,7 +170,7 @@ func runSearchQueryInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, wh
 		LEFT JOIN (
 			SELECT issue_id, COUNT(*) AS cnt
 			FROM %s
-			WHERE type = 'blocks'
+			WHERE type = 'blocks' AND %s
 			GROUP BY issue_id
 		) dc ON dc.issue_id = i.id
 		LEFT JOIN (
@@ -143,40 +180,43 @@ func runSearchQueryInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, wh
 		) rc ON rc.dep_id = i.id
 		LEFT JOIN (
 			SELECT issue_id, COUNT(*) AS cnt
-			FROM %s
+			FROM %s WHERE %s
 			GROUP BY issue_id
 		) cc ON cc.issue_id = i.id
 		LEFT JOIN (
 			SELECT issue_id,
 			       MIN(COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external)) AS parent_id
 			FROM %s
-			WHERE type = 'parent-child'
+			WHERE type = 'parent-child' AND %s
 			GROUP BY issue_id
 		) pc ON pc.issue_id = i.id
 		LEFT JOIN (
 			SELECT issue_id, JSON_ARRAYAGG(%s) AS deps_json
-			FROM %s
+			FROM %s WHERE %s
 			GROUP BY issue_id
 		) d ON d.issue_id = i.id
-		%s
-		%s
-		%s
+		WHERE %s
 	`,
 		readyWorkIssueColumns,
 		labelsSelect,
 		tables.Main,
 		labelsJoin,
 		tables.Dependencies,
-		reverseBlockerSelect,
+		dependencyCountScope,
+		strings.Join(reverseBlockers, " UNION ALL "),
 		tables.Comments,
+		scope("issue_id"),
 		tables.Dependencies,
+		scope("issue_id"),
 		readyWorkDepJSONObject,
 		tables.Dependencies,
-		whereSQL,
-		orderBySQL,
-		limitSQL,
+		scope("issue_id"),
+		scope("i.id"),
 	)
+	return searchSQL, args
+}
 
+func scanIssueCountsInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, searchSQL string, args []any) ([]*types.IssueWithCounts, error) {
 	rows, err := tx.QueryContext(ctx, searchSQL, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search count %s: %w", tables.Main, err)
@@ -184,19 +224,11 @@ func runSearchQueryInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, wh
 	defer func() { _ = rows.Close() }()
 
 	var out []*types.IssueWithCounts
-	seen := make(map[string]bool)
 	for rows.Next() {
 		iwc, scanErr := scanReadyWorkRowWithCounts(rows)
 		if scanErr != nil {
 			return nil, scanErr
 		}
-		if iwc == nil || iwc.Issue == nil {
-			continue
-		}
-		if seen[iwc.Issue.ID] {
-			continue
-		}
-		seen[iwc.Issue.ID] = true
 		out = append(out, iwc)
 	}
 	if err := rows.Err(); err != nil {

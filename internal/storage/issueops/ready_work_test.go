@@ -12,16 +12,8 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-func deferredParentProbeRegex(issueTable string) string {
-	return `SELECT 1 FROM ` + issueTable + `\s+WHERE defer_until IS NOT NULL\s+AND defer_until > UTC_TIMESTAMP\(\)\s+LIMIT 1`
-}
-
-func deferredChildrenQueryRegex(depTable, issueTable string) string {
-	targetCol := "depends_on_issue_id"
-	if issueTable == "wisps" {
-		targetCol = "depends_on_wisp_id"
-	}
-	return `SELECT dep\.issue_id\s+FROM ` + depTable + ` dep\s+JOIN ` + issueTable + ` parent ON parent\.id = dep\.` + targetCol + `\s+WHERE dep\.type = 'parent-child'\s+AND parent\.defer_until IS NOT NULL\s+AND parent\.defer_until > UTC_TIMESTAMP\(\)`
+func candidateParentEdgesRegex(depTable string) string {
+	return `SELECT issue_id, depends_on_issue_id, depends_on_wisp_id FROM ` + depTable + `\s+WHERE issue_id IN `
 }
 
 func beginMockTx(t *testing.T) (*sql.DB, sqlmock.Sqlmock, *sql.Tx) {
@@ -101,7 +93,10 @@ func TestGetReadyWorkInTx_PropagatesDeferredParentChildError(t *testing.T) {
 
 	_, mock, tx := beginMockTx(t)
 	childErr := errors.New("dolt transient dependency read failure")
-	mock.ExpectQuery(deferredParentProbeRegex("issues")).WillReturnError(childErr)
+	mock.ExpectQuery(`SELECT i\.id FROM issues i`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("candidate"))
+	mock.ExpectQuery(candidateParentEdgesRegex("dependencies")).
+		WithArgs("candidate").WillReturnError(childErr)
 
 	_, err := GetReadyWorkInTx(
 		context.Background(),
@@ -165,27 +160,29 @@ func TestGetChildrenOfDeferredParentsInTx_ReturnsChildrenFromBothDependencyTable
 	t.Parallel()
 
 	_, mock, tx := beginMockTx(t)
-	mock.ExpectQuery(deferredParentProbeRegex("issues")).
-		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
-	mock.ExpectQuery(deferredChildrenQueryRegex("dependencies", "issues")).
-		WillReturnRows(sqlmock.NewRows([]string{"issue_id"}).AddRow("child-from-dependencies-issues"))
-	mock.ExpectQuery(deferredChildrenQueryRegex("dependencies", "wisps")).
-		WillReturnRows(sqlmock.NewRows([]string{"issue_id"}).AddRow("child-from-dependencies-wisps"))
-	mock.ExpectQuery(deferredChildrenQueryRegex("wisp_dependencies", "issues")).
-		WillReturnRows(sqlmock.NewRows([]string{"issue_id"}).AddRow("child-from-wisp-dependencies-issues"))
-	mock.ExpectQuery(deferredChildrenQueryRegex("wisp_dependencies", "wisps")).
-		WillReturnRows(sqlmock.NewRows([]string{"issue_id"}).AddRow("child-from-wisp-dependencies-wisps"))
-
-	got, err := getChildrenOfDeferredParentsInTx(context.Background(), tx)
-	if err != nil {
-		t.Fatalf("getChildrenOfDeferredParentsInTx: %v", err)
-	}
-	want := []string{
+	candidates := []string{
 		"child-from-dependencies-issues",
 		"child-from-dependencies-wisps",
 		"child-from-wisp-dependencies-issues",
 		"child-from-wisp-dependencies-wisps",
 	}
+	cols := []string{"issue_id", "depends_on_issue_id", "depends_on_wisp_id"}
+	mock.ExpectQuery(candidateParentEdgesRegex("dependencies")).
+		WithArgs(candidates[0], candidates[1], candidates[2], candidates[3]).
+		WillReturnRows(sqlmock.NewRows(cols).AddRow(candidates[0], "issue-parent", nil).AddRow(candidates[1], nil, "wisp-parent"))
+	mock.ExpectQuery(candidateParentEdgesRegex("wisp_dependencies")).
+		WithArgs(candidates[0], candidates[1], candidates[2], candidates[3]).
+		WillReturnRows(sqlmock.NewRows(cols).AddRow(candidates[2], "issue-parent", nil).AddRow(candidates[3], nil, "wisp-parent"))
+	mock.ExpectQuery(`SELECT id FROM issues WHERE id IN`).WithArgs("issue-parent").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("issue-parent"))
+	mock.ExpectQuery(`SELECT id FROM wisps WHERE id IN`).WithArgs("wisp-parent").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("wisp-parent"))
+
+	got, err := getChildrenOfDeferredParentsInTx(context.Background(), tx, candidates)
+	if err != nil {
+		t.Fatalf("getChildrenOfDeferredParentsInTx: %v", err)
+	}
+	want := map[string]struct{}{candidates[0]: {}, candidates[1]: {}, candidates[2]: {}, candidates[3]: {}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("children = %v, want %v", got, want)
 	}
@@ -194,16 +191,11 @@ func TestGetChildrenOfDeferredParentsInTx_ReturnsChildrenFromBothDependencyTable
 	}
 }
 
-func TestGetChildrenOfDeferredParentsInTx_NoDeferredParentsExitsAfterProbe(t *testing.T) {
+func TestGetChildrenOfDeferredParentsInTx_NoCandidatesSkipsSQL(t *testing.T) {
 	t.Parallel()
 
 	_, mock, tx := beginMockTx(t)
-	mock.ExpectQuery(deferredParentProbeRegex("issues")).
-		WillReturnRows(sqlmock.NewRows([]string{"1"}))
-	mock.ExpectQuery(deferredParentProbeRegex("wisps")).
-		WillReturnRows(sqlmock.NewRows([]string{"1"}))
-
-	got, err := getChildrenOfDeferredParentsInTx(context.Background(), tx)
+	got, err := getChildrenOfDeferredParentsInTx(context.Background(), tx, nil)
 	if err != nil {
 		t.Fatalf("getChildrenOfDeferredParentsInTx: %v", err)
 	}
@@ -219,20 +211,22 @@ func TestGetChildrenOfDeferredParentsInTx_IgnoresMissingWispDependenciesTable(t 
 	t.Parallel()
 
 	_, mock, tx := beginMockTx(t)
-	mock.ExpectQuery(deferredParentProbeRegex("issues")).
-		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
-	mock.ExpectQuery(deferredChildrenQueryRegex("dependencies", "issues")).
-		WillReturnRows(sqlmock.NewRows([]string{"issue_id"}).AddRow("child-from-dependencies-issues"))
-	mock.ExpectQuery(deferredChildrenQueryRegex("dependencies", "wisps")).
-		WillReturnRows(sqlmock.NewRows([]string{"issue_id"}).AddRow("child-from-dependencies-wisps"))
-	mock.ExpectQuery(deferredChildrenQueryRegex("wisp_dependencies", "issues")).
+	mock.ExpectQuery(candidateParentEdgesRegex("dependencies")).
+		WillReturnRows(sqlmock.NewRows([]string{"issue_id", "depends_on_issue_id", "depends_on_wisp_id"}).
+			AddRow("child-from-dependencies-issues", "issue-parent", nil).
+			AddRow("child-from-dependencies-wisps", nil, "wisp-parent"))
+	mock.ExpectQuery(candidateParentEdgesRegex("wisp_dependencies")).
 		WillReturnError(errors.New("table wisp_dependencies does not exist"))
+	mock.ExpectQuery(`SELECT id FROM issues WHERE id IN`).WithArgs("issue-parent").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("issue-parent"))
+	mock.ExpectQuery(`SELECT id FROM wisps WHERE id IN`).WithArgs("wisp-parent").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("wisp-parent"))
 
-	got, err := getChildrenOfDeferredParentsInTx(context.Background(), tx)
+	got, err := getChildrenOfDeferredParentsInTx(context.Background(), tx, []string{"child-from-dependencies-issues", "child-from-dependencies-wisps"})
 	if err != nil {
 		t.Fatalf("getChildrenOfDeferredParentsInTx: %v", err)
 	}
-	want := []string{"child-from-dependencies-issues", "child-from-dependencies-wisps"}
+	want := map[string]struct{}{"child-from-dependencies-issues": {}, "child-from-dependencies-wisps": {}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("children = %v, want %v", got, want)
 	}

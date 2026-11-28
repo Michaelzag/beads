@@ -17,11 +17,11 @@ func GetReadyWorkWithCountsInTx(ctx context.Context, tx *sql.Tx, filter types.Wo
 		return nil, fmt.Errorf("get ready work with counts: wisp dependency probe: %w", err)
 	}
 
-	issuePreds, err := buildReadyWorkPredicates(ctx, tx, filter, IssuesFilterTables)
+	issueIDs, err := queryReadyWorkCandidatesInTx(ctx, tx, filter, IssuesFilterTables)
 	if err != nil {
 		return nil, err
 	}
-	out, err := runSearchQueryInTx(ctx, tx, IssuesFilterTables, issuePreds.whereSQL, issuePreds.orderBySQL, issuePreds.limitSQL, issuePreds.args, wispDepsExist, false)
+	out, err := hydrateIssueCountsInTx(ctx, tx, IssuesFilterTables, issueIDs, wispDepsExist, false)
 	if err != nil {
 		return nil, err
 	}
@@ -37,11 +37,14 @@ func GetReadyWorkWithCountsInTx(ctx context.Context, tx *sql.Tx, filter types.Wo
 		return out, nil
 	}
 
-	wispPreds, err := buildReadyWorkPredicates(ctx, tx, filter, WispsFilterTables)
+	wispIDs, err := queryReadyWorkCandidatesInTx(ctx, tx, filter, WispsFilterTables)
 	if err != nil {
+		if isTableNotExistError(err) {
+			return out, nil
+		}
 		return nil, err
 	}
-	wisps, err := runSearchQueryInTx(ctx, tx, WispsFilterTables, wispPreds.whereSQL, wispPreds.orderBySQL, wispPreds.limitSQL, wispPreds.args, true, false)
+	wisps, err := hydrateIssueCountsInTx(ctx, tx, WispsFilterTables, wispIDs, true, false)
 	if err != nil {
 		if isTableNotExistError(err) {
 			return out, nil
@@ -111,6 +114,7 @@ var readyWorkIssueColumns = func() string {
 }()
 
 const readyWorkDepJSONObject = `JSON_OBJECT(
+	'row_id', id,
 	'issue_id', issue_id,
 	'depends_on_id', COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external),
 	'type', type,
@@ -151,11 +155,20 @@ func scanReadyWorkRowWithCounts(rows *sql.Rows) (*types.IssueWithCounts, error) 
 	}
 
 	if depsJSON.Valid && depsJSON.String != "" {
-		var deps []*types.Dependency
+		var deps []struct {
+			RowID string `json:"row_id"`
+			types.Dependency
+		}
 		if err := json.Unmarshal([]byte(depsJSON.String), &deps); err != nil {
 			return nil, fmt.Errorf("scan issue with counts: parse deps_json: %w", err)
 		}
-		issue.Dependencies = deps
+		// The old full scan visited dependency rows in primary-key order.
+		// An issue_id index can visit them in target order instead.
+		sort.SliceStable(deps, func(i, j int) bool { return deps[i].RowID < deps[j].RowID })
+		issue.Dependencies = make([]*types.Dependency, len(deps))
+		for i := range deps {
+			issue.Dependencies[i] = &deps[i].Dependency
+		}
 	}
 
 	iwc := &types.IssueWithCounts{
